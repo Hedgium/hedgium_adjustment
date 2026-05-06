@@ -1,12 +1,15 @@
 """
 Standalone Greek computation for the worker.
 
-Reads bid/ask from Redis ticks (written by ws_stream), then computes
-Black-Scholes Greeks via py_vollib — same core math as the Django
-``greeks_service.get_greeks_for_position``.
+Mirrors the three-path logic of ``optionchain.greeks_service.get_greeks_for_position``:
 
-Does NOT write to the DB; results are used only for delta-band checks
-and then forwarded to the backend ``/internal/adjustments/trigger`` endpoint.
+  1. MANUAL source  — stored delta adjusted for spot move via stored gamma.
+                      Never uses Black-Scholes.  Never writes to DB.
+  2. AUTO baseline  — stored AUTO delta adjusted for current spot via stored gamma.
+  3. BS fallback    — fresh implied-vol → Black-Scholes when no usable stored baseline.
+
+Stored Greek data comes from the ``OptionChainStore`` which is loaded from
+``GET /internal/option-chains/`` at startup and refreshed on every session reload.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import logging
 import math
 from collections import defaultdict
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Optional
 
 import config as cfg
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
@@ -53,8 +56,7 @@ def _bs_greeks(
     iv: float,
 ) -> dict:
     """
-    Compute BS greeks using py_vollib.
-
+    Compute full BS Greeks using py_vollib.
     Returns dict with iv, delta, gamma, theta, vega or empty dict on failure.
     """
     try:
@@ -112,17 +114,48 @@ def get_greeks_for_position(
     expiry: date,
     quantity: int,
     instrument_label: str,
+    stored_chain: Optional[dict] = None,
 ) -> Optional[dict]:
     """
-    Compute net Greeks for one position.
+    Compute net Greeks for one position using the same three-path logic as
+    ``optionchain.greeks_service.get_greeks_for_position``:
+
+    Path 1 — MANUAL
+        ``stored_chain["greeks_calculated_by"] == "MANUAL"`` and
+        ``stored_chain["stored_delta"]`` is not None.
+        Delta = (S - manual_spot) × gamma + old_delta   (spot-adjusted)
+        Falls back to old_delta when manual_delta_spot is None.
+        No Black-Scholes is run.
+
+    Path 2 — AUTO baseline
+        ``greeks_calculated_by == "AUTO"`` and both ``stored_delta`` and
+        ``auto_delta_spot`` are available.
+        Delta = (S - auto_spot) × gamma + old_delta
+
+    Path 3 — Black-Scholes (default)
+        Fresh IV calculation from the current market mid-price, then full BS.
+        Used when stored_chain is None, stored_delta is None, or expiry has
+        no stored baseline.
+
+    ``stored_chain`` is a row from ``OptionChainStore.get_chain_by_token()``.
+    It may be None when the store hasn't loaded the token yet.
 
     Returns a dict or None if data is insufficient.
     """
+    if not zerodha_instrument_token or int(zerodha_instrument_token) <= 0:
+        return None
+
+    tok = int(zerodha_instrument_token)
+    if quantity == 0:
+        return None
+
     flag = "c" if str(option_type).upper() == "CE" else "p"
     t = _tte_years(expiry)
     r_rate = DEFAULT_RISK_FREE_RATE
+    S = float(underlying_spot)
 
-    tick = fetch_tick_by_token(r, zerodha_instrument_token)
+    # ── Market quotes from Redis ──────────────────────────────────────────────
+    tick = fetch_tick_by_token(r, tok)
     bid: float = 0.0
     ask: float = 0.0
     ltp: float = 0.0
@@ -135,48 +168,119 @@ def get_greeks_for_position(
         except (TypeError, ValueError):
             pass
 
-    if bid <= 0 and ask <= 0:
-        logger.debug(
-            "greeks: no tick data for token=%s instrument=%r",
-            zerodha_instrument_token, instrument_label,
-        )
-        return None
-
+    # For MANUAL / AUTO-baseline paths we only need bid/ask for output, not for
+    # delta computation.  For the BS path we need a usable mid-price.
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask, ltp)
 
-    iv = _implied_vol(flag, mid, underlying_spot, strike, t, r_rate)
-    if iv is None or iv <= 0:
+    # ── Determine calculation path ────────────────────────────────────────────
+    sc = stored_chain or {}
+    calc_by = (sc.get("greeks_calculated_by") or "").upper()
+    stored_delta = sc.get("stored_delta")
+    stored_gamma = sc.get("stored_gamma") or 0.0
+    stored_vega  = sc.get("stored_vega")  or 0.0
+    stored_theta = sc.get("stored_theta") or 0.0
+
+    manual_mode = (
+        calc_by == "MANUAL"
+        and stored_delta is not None
+    )
+    auto_baseline_mode = (
+        not manual_mode
+        and calc_by == "AUTO"
+        and stored_delta is not None
+        and sc.get("auto_delta_spot") is not None
+    )
+
+    # ── Path 1: MANUAL ───────────────────────────────────────────────────────
+    if manual_mode:
+        manual_spot = sc.get("manual_delta_spot")
+        if manual_spot is not None:
+            delta_pu = (S - float(manual_spot)) * float(stored_gamma) + float(stored_delta)
+        else:
+            delta_pu = float(stored_delta)
+        gamma_pu = float(stored_gamma)
+        vega_pu  = float(stored_vega)
+        theta_pu = float(stored_theta)
+        iv_val   = 0.0
+
         logger.debug(
-            "greeks: IV failed for token=%s instrument=%r mid=%s spot=%s strike=%s t=%.4f",
-            zerodha_instrument_token, instrument_label, mid, underlying_spot, strike, t,
+            "greeks[MANUAL]: token=%s spot=%.2f manual_spot=%s stored_delta=%s "
+            "gamma=%s → delta_pu=%.6f",
+            tok, S, manual_spot, stored_delta, stored_gamma, delta_pu,
         )
-        return None
 
-    g = _bs_greeks(flag, underlying_spot, strike, t, r_rate, iv)
-    if not g:
-        return None
+    # ── Path 2: AUTO baseline ────────────────────────────────────────────────
+    elif auto_baseline_mode:
+        auto_spot = float(sc["auto_delta_spot"])
+        delta_pu = (S - auto_spot) * float(stored_gamma) + float(stored_delta)
+        gamma_pu = float(stored_gamma)
+        vega_pu  = float(stored_vega)
+        theta_pu = float(stored_theta)
+        iv_val   = 0.0
 
-    q = quantity
+        logger.debug(
+            "greeks[AUTO]: token=%s spot=%.2f auto_spot=%.2f stored_delta=%s "
+            "gamma=%s → delta_pu=%.6f",
+            tok, S, auto_spot, stored_delta, stored_gamma, delta_pu,
+        )
+
+    # ── Path 3: Black-Scholes ────────────────────────────────────────────────
+    else:
+        if bid <= 0 and ask <= 0:
+            logger.debug(
+                "greeks[BS]: no tick data token=%s instrument=%r",
+                tok, instrument_label,
+            )
+            return None
+
+        iv = _implied_vol(flag, mid, S, float(strike), t, r_rate)
+        if iv is None or iv <= 0:
+            logger.debug(
+                "greeks[BS]: IV failed token=%s instrument=%r mid=%s spot=%s "
+                "strike=%s t=%.4f",
+                tok, instrument_label, mid, S, strike, t,
+            )
+            return None
+
+        g = _bs_greeks(flag, S, float(strike), t, r_rate, iv)
+        if not g:
+            return None
+
+        delta_pu = g["delta"]
+        gamma_pu = g["gamma"]
+        vega_pu  = g["vega"]
+        theta_pu = g["theta"]
+        iv_val   = g["iv"]
+
+    # ── Build output (mirrors greeks_service.py output shape) ────────────────
+    q    = quantity
     sign = 1 if q > 0 else -1 if q < 0 else 0
-    abs_qty = abs(q)
+    aq   = abs(q)
+
+    print(f"greeks_for_position: {instrument_label} tok:{tok} bid:{bid} ask:{ask} ltp:{ltp} mid:{mid} iv:{iv_val} net_delta:{round(delta_pu * aq * sign, 6)}")
 
     return {
-        "instrument": instrument_label,
-        "zerodha_instrument_token": zerodha_instrument_token,
-        "bid": bid,
-        "ask": ask,
-        "ltp": ltp,
-        "mid": mid,
-        "iv": g["iv"],
-        "delta": g["delta"],
-        "gamma": g["gamma"],
-        "theta": g["theta"],
-        "vega": g["vega"],
-        "net_delta": g["delta"] * abs_qty * sign,
-        "net_gamma": g["gamma"] * abs_qty * sign,
-        "net_theta": g["theta"] * abs_qty * sign,
-        "net_vega": g["vega"] * abs_qty * sign,
-        "quantity": q,
+        "instrument":              instrument_label,
+        "zerodha_instrument_token": tok,
+        "bid":       bid,
+        "ask":       ask,
+        "ltp":       ltp,
+        "mid":       mid,
+        "iv":        iv_val,
+        "delta":     delta_pu,
+        "gamma":     gamma_pu,
+        "theta":     theta_pu,
+        "vega":      vega_pu,
+        "net_delta": round(delta_pu * aq * sign, 6),
+        "net_gamma": round(gamma_pu * aq * sign, 6),
+        "net_theta": round(theta_pu * aq * sign, 6),
+        "net_vega":  round(vega_pu  * aq * sign, 6),
+        "quantity":  q,
+        "greeks_source": (
+            "manual" if manual_mode
+            else "auto_baseline" if auto_baseline_mode
+            else "bs"
+        ),
     }
 
 
@@ -215,12 +319,21 @@ def get_underlying_spot(r, underlying_symbol: str, leg_token: Optional[int] = No
 # Full builder Greek snapshot
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_greeks_for_builder(r, builder_data: dict) -> Optional[dict]:
+def compute_greeks_for_builder(
+    r,
+    builder_data: dict,
+    option_chain_store=None,
+) -> Optional[dict]:
     """
     Compute Greek snapshot for a single builder using data from the backend API.
 
     ``builder_data`` is one item from ``/internal/adjustments/builders``
     ``builders`` list.
+
+    ``option_chain_store`` is an optional ``OptionChainStore`` instance.  When
+    provided, stored Greek data (MANUAL / AUTO-baseline) is looked up per token
+    and passed to ``get_greeks_for_position``, enabling the same three-path
+    calculation as the Django backend's ``greeks_service``.
 
     Returns a snapshot dict or None if skipped.
     """
@@ -280,6 +393,11 @@ def compute_greeks_for_builder(r, builder_data: dict) -> Optional[dict]:
             )
             continue
 
+        # Look up stored Greeks from the option chain store (for MANUAL / AUTO paths)
+        stored_chain: Optional[dict] = None
+        if option_chain_store is not None:
+            stored_chain = option_chain_store.get_chain_by_token(int(tok))
+
         greeks = get_greeks_for_position(
             r,
             zerodha_instrument_token=int(tok),
@@ -289,6 +407,7 @@ def compute_greeks_for_builder(r, builder_data: dict) -> Optional[dict]:
             expiry=expiry,
             quantity=int(quantity),
             instrument_label=instrument,
+            stored_chain=stored_chain,
         )
 
         if greeks:
@@ -300,11 +419,11 @@ def compute_greeks_for_builder(r, builder_data: dict) -> Optional[dict]:
                 "strike": float(strike),
                 "quantity": int(quantity),
                 "exchange": exchange,
-                "zerodha_tradingsymbol": "",
-                "lot_size": lot_size,
+                "zerodha_tradingsymbol": pos.get("zerodha_tradingsymbol") or "",
+                "lot_size": int(lot_size),
                 "expiry": expiry_str,
-                "bid": greeks.get("bid"),
-                "ask": greeks.get("ask"),
+                "bid": float(greeks.get("bid") or 0.0),
+                "ask": float(greeks.get("ask") or 0.0),
                 "instrument_token": int(tok),
             })
 

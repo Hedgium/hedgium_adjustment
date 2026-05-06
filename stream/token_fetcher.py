@@ -23,26 +23,30 @@ class StreamTokenSet:
     underlying_token_by_symbol: dict[str, int]
 
 
-def _fetch_initial_ltps(
+def fetch_ltps_from_kite(
     api_key: str,
     access_token: str,
-    underlying_tokens: list[int],
+    tokens: list[int],
 ) -> dict[int, float]:
     """
-    Seed underlying LTPs via Kite REST /quote endpoint (same logic as KiteConnector.get_ltp).
+    Fetch last-traded prices for a list of instrument tokens via Kite REST
+    ``/quote/ohlc``.  Returns ``{instrument_token: last_price}`` for each
+    token that has a price; silently omits tokens that the API doesn't return.
+
+    Used both as the LTP seed at startup and as the runtime fallback when a
+    token's tick is not yet present in Redis.
     """
-    if not underlying_tokens:
+    if not tokens:
         return {}
     try:
         import requests as _requests
+        from urllib.parse import quote as _quote
 
         headers = {
             "X-Kite-Version": "3",
             "Authorization": f"token {api_key}:{access_token}",
         }
-        from urllib.parse import quote as _quote
-
-        tokens_str = "&i=".join(_quote(str(t), safe="") for t in underlying_tokens)
+        tokens_str = "&i=".join(_quote(str(t), safe="") for t in tokens)
         url = f"https://api.kite.trade/quote/ohlc?i={tokens_str}"
         resp = _requests.get(url, headers=headers, timeout=10)
         data = resp.json()
@@ -54,8 +58,17 @@ def _fetch_initial_ltps(
                 out[int(inst_tok)] = float(lp)
         return out
     except Exception as exc:
-        logger.warning("token_fetcher: LTP seed failed: %s", exc)
+        logger.warning("token_fetcher: LTP fetch failed: %s", exc)
         return {}
+
+
+def _fetch_initial_ltps(
+    api_key: str,
+    access_token: str,
+    underlying_tokens: list[int],
+) -> dict[int, float]:
+    """Seed underlying LTPs at startup — thin wrapper around fetch_ltps_from_kite."""
+    return fetch_ltps_from_kite(api_key, access_token, underlying_tokens)
 
 
 def collect_stream_tokens(credentials: dict) -> StreamTokenSet:

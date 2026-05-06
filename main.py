@@ -2,7 +2,18 @@
 hedgium_stream_worker — entry point.
 
 Connects to the Kite WebSocket, writes ticks to shared Redis, and runs the
-adjustment polling loop — all without Django / ORM.
+full live pipeline:
+
+  - Option chain store (in-memory, refreshed from backend every
+    GREEKS_UPDATE_INTERVAL_S seconds; picks up MANUAL/AUTO source changes
+    automatically without restarting)
+  - Greek persist thread (bulk-upserts Greeks to backend DB every
+    GREEKS_PERSIST_INTERVAL_S seconds)
+  - Live positions thread (fetches broker positions every
+    POSITIONS_REFRESH_INTERVAL_S seconds, maps to builders, triggers dynamic
+    WebSocket subscription updates for new/removed tokens)
+  - Adjustment runner (delta-band checks using live positions, every
+    ADJUSTMENTS_INTERVAL_S seconds)
 
 Usage::
 
@@ -10,11 +21,6 @@ Usage::
 
 Env vars (see config.py / .env.example):
     BACKEND_API_URL, INTERNAL_SERVICE_TOKEN, REDIS_URL, WORKER_STREAM_MODE, …
-
-The worker shares the same Redis instance as the Django backend; all Redis key
-names are identical to those written by the Django ``run_mystream`` management
-command so backend readers (greeks service, stream status page, etc.) continue
-to work unchanged.
 """
 
 from __future__ import annotations
@@ -30,8 +36,6 @@ import threading
 import time
 from datetime import datetime, timezone
 
-# config.py uses python-decouple which auto-reads .env from CWD.
-
 import config as cfg
 
 # ── Logging setup ────────────────────────────────────────────────────────────
@@ -43,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hedgium_stream_worker")
 
-# ── Deferred imports (after env/logging are ready) ───────────────────────────
+# ── Deferred imports ─────────────────────────────────────────────────────────
 import redis as _redis
 
 from client import backend_api
@@ -56,8 +60,10 @@ from stream.redis_writer import (
     write_underlying_symbol_token_map,
 )
 from stream.token_fetcher import collect_stream_tokens
-from stream.ws_stream import run_multi_connection_stream
+from stream.ws_stream import KiteQuoteStreamer, run_multi_connection_stream
 from adjustments.runner import AdjustmentRunner
+from adjustments.option_chain_store import OptionChainStore
+from adjustments.positions_manager import LivePositionsManager
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -76,7 +82,7 @@ def _wait_for_credentials() -> dict:
             if "error" in creds:
                 raise ValueError(creds["error"])
             if not creds.get("api_key") or not creds.get("access_token"):
-                raise ValueError("api_key or access_token missing in credentials response")
+                raise ValueError("api_key or access_token missing")
             return creds
         except Exception as exc:
             logger.warning(
@@ -101,6 +107,35 @@ def _wait_for_tokens(credentials: dict):
             time.sleep(cfg.WAIT_POLL_S)
 
 
+def _load_option_chains(
+    option_chain_store: OptionChainStore,
+    underlying_symbols: list[str] | None = None,
+) -> None:
+    """
+    Fetch full OptionChain rows from backend and load into the store.
+
+    Tries ``mode=auto`` first (positions-filtered).  If that returns zero rows
+    (e.g. no open positions yet), falls back to ``mode=full`` so the store is
+    always seeded and Greeks can be computed for the entire subscribed universe.
+    """
+    try:
+        resp = backend_api.get_option_chains(underlying_symbols or None, mode="auto")
+        chains = resp.get("option_chains") or []
+        if not chains:
+            logger.info(
+                "worker: option-chains auto mode returned 0 rows — falling back to mode=full"
+            )
+            resp = backend_api.get_option_chains(underlying_symbols or None, mode="full")
+            chains = resp.get("option_chains") or []
+        option_chain_store.load(chains)
+        logger.info(
+            "worker: option chain store loaded %s rows (mode=%s)",
+            len(chains), resp.get("mode", "?"),
+        )
+    except Exception:
+        logger.exception("worker: failed to load option chains from backend")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,6 +158,10 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # Shared state objects (persist across inner restarts)
+    option_chain_store = OptionChainStore()
+    positions_manager = LivePositionsManager()
+
     # ── outer restart loop ────────────────────────────────────────────────────
     while not _stop_requested.is_set():
 
@@ -136,32 +175,152 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         option_tokens = sorted(set(token_set.option_tokens))
         underlying_symbols = sorted(token_set.underlying_token_by_symbol.keys())
 
-        # 3. Tick queue + workers
+        # 3. Load option chains into memory store
+        _load_option_chains(option_chain_store, underlying_symbols)
+
+        # 4. Tick queue + persist-active guard
         tick_q: queue.Queue = queue.Queue()
-        stop_greeks_event = threading.Event()
+        stop_threads_event = threading.Event()
         last_atm_sync_t = [0.0]
 
-        def _persist_active() -> bool:
-            return r.get(cfg.REDIS_PERSIST_ENABLED_KEY) != "0"
+        # Current subscribed token set (mutable list shared with positions thread)
+        current_tokens: list[int] = list(all_tokens)
+        current_tokens_lock = threading.Lock()
 
-        def _periodic_greeks():
-            logger.debug("worker: periodic greeks thread started")
-            if stop_greeks_event.wait(min(3.0, cfg.GREEKS_FULL_INTERVAL_S)):
+        def _persist_active() -> bool:
+            return cfg.GREEKS_PERSIST_ENABLED
+
+        # Signals the persist thread to flush immediately after the first
+        # successful Greek update rather than waiting the full persist interval.
+        _first_greeks_ready = threading.Event()
+
+        # ── Greek update thread ───────────────────────────────────────────────
+        def _greek_update_thread():
+            logger.info("worker: Greek update thread started (interval=%.0fs)", cfg.GREEKS_UPDATE_INTERVAL_S)
+            # Initial delay — let the WS stream warm up
+            if stop_threads_event.wait(min(10.0, cfg.GREEKS_UPDATE_INTERVAL_S)):
                 return
-            while not stop_greeks_event.wait(cfg.GREEKS_FULL_INTERVAL_S):
-                if not option_tokens or not _persist_active():
+            while not stop_threads_event.wait(cfg.GREEKS_UPDATE_INTERVAL_S):
+                # Re-fetch option chain metadata every cycle so that backend
+                # changes (e.g. switching source to MANUAL, strike updates) are
+                # picked up automatically without restarting the worker.
+                try:
+                    _load_option_chains(option_chain_store)
+                except Exception:
+                    logger.exception("worker: option chain reload error")
+
+                store_size = option_chain_store.size()
+                if not store_size:
+                    logger.info("worker: Greek update — store empty (chains not loaded yet), skipping")
                     continue
                 try:
-                    greeks_payload = _collect_greeks_for_bulk_upsert(r, option_tokens)
-                    if greeks_payload:
-                        stats = backend_api.post_greeks_bulk_upsert(greeks_payload)
-                        logger.info(
-                            "worker: periodic greeks upsert tokens=%s stats=%s",
-                            len(option_tokens), stats,
-                        )
+                    updated = option_chain_store.update_greeks(r, credentials)
+                    logger.info(
+                        "worker: Greek update done — updated=%s/%s",
+                        updated, store_size,
+                    )
+                    if updated > 0:
+                        _first_greeks_ready.set()
                 except Exception:
-                    logger.exception("worker: periodic greeks error")
+                    logger.exception("worker: Greek update error")
 
+        def _do_persist():
+            """Run one persist cycle — call the bulk-upsert API if payload is non-empty."""
+            if not _persist_active():
+                logger.debug("worker: Greek persist disabled (Redis flag), skipping")
+                return
+            payload = option_chain_store.get_greeks_payload()
+            if payload:
+                stats = backend_api.post_greeks_bulk_upsert(payload)
+                logger.info(
+                    "worker: Greek persist upsert — tokens=%s stats=%s",
+                    len(payload), stats,
+                )
+            else:
+                logger.info(
+                    "worker: Greek persist — payload empty (store=%s rows, none with computed Greeks yet)",
+                    option_chain_store.size(),
+                )
+
+        # ── Greek persist thread ──────────────────────────────────────────────
+        def _greek_persist_thread():
+            logger.info("worker: Greek persist thread started (interval=%.0fs)", cfg.GREEKS_PERSIST_INTERVAL_S)
+            # Wait for the first Greeks to be computed (at most GREEKS_PERSIST_INTERVAL_S)
+            # so we persist as soon as data is available rather than at a fixed delay.
+            _first_greeks_ready.wait(timeout=cfg.GREEKS_PERSIST_INTERVAL_S)
+            if stop_threads_event.is_set():
+                return
+            try:
+                _do_persist()
+            except Exception:
+                logger.exception("worker: Greek persist error (initial flush)")
+            # Then run on the regular cadence
+            while not stop_threads_event.wait(cfg.GREEKS_PERSIST_INTERVAL_S):
+                try:
+                    _do_persist()
+                except Exception:
+                    logger.exception("worker: Greek persist error")
+
+        # ── Live positions thread ─────────────────────────────────────────────
+        def _positions_thread():
+            logger.debug(
+                "worker: live positions thread started (interval=%.0fs)",
+                cfg.POSITIONS_REFRESH_INTERVAL_S,
+            )
+            if stop_threads_event.wait(5.0):
+                return
+            while not stop_threads_event.wait(cfg.POSITIONS_REFRESH_INTERVAL_S):
+                try:
+                    changed = positions_manager.refresh()
+                    if not changed:
+                        continue
+
+                    new_live_tokens = positions_manager.get_all_tokens()
+                    with current_tokens_lock:
+                        old_set = set(current_tokens)
+
+                    add_tokens = sorted(new_live_tokens - old_set)
+                    # Do not remove option tokens that are part of the original
+                    # stream config — only add new ones from live positions.
+                    if not add_tokens:
+                        continue
+
+                    logger.info(
+                        "worker: live positions changed → subscribing %s new tokens",
+                        len(add_tokens),
+                    )
+
+                    # Distribute new tokens across streams
+                    total_per_stream = cfg.MAX_INSTRUMENTS_PER_WS
+                    add_queue = list(add_tokens)
+                    for s in streams:
+                        if not add_queue:
+                            break
+                        spare = total_per_stream - len(s.tokens)
+                        if spare <= 0:
+                            continue
+                        batch = add_queue[:spare]
+                        add_queue = add_queue[spare:]
+                        s.update_subscriptions(add_tokens=batch, remove_tokens=[])
+
+                    with current_tokens_lock:
+                        current_tokens.extend(add_tokens)
+
+                    # Seed LTPs for new underlying tokens via Kite REST if they are
+                    # equity tokens (instrument type heuristic: token < 5_000_000)
+                    new_equity = [t for t in add_tokens if t < 5_000_000]
+                    if new_equity:
+                        from stream.token_fetcher import fetch_ltps_from_kite
+                        ltp_map = fetch_ltps_from_kite(
+                            credentials["api_key"], credentials["access_token"], new_equity
+                        )
+                        if ltp_map:
+                            write_ltps(r, ltp_map)
+
+                except Exception:
+                    logger.exception("worker: live positions thread error")
+
+        # ── Tick worker ───────────────────────────────────────────────────────
         def _tick_worker():
             while True:
                 batch = tick_q.get()
@@ -192,7 +351,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             except Exception:
                 logger.exception("worker: Redis write failed")
 
-        # 4. Start WebSocket streams
+        # 5. Start WebSocket streams
         try:
             streams = run_multi_connection_stream(
                 api_key=credentials["api_key"],
@@ -209,7 +368,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             time.sleep(cfg.WAIT_POLL_S)
             continue
 
-        # 5. Publish Redis state (same keys as Django run_mystream)
+        # 6. Publish Redis state
         r.delete(cfg.REDIS_STOP_KEY)
         r.set(cfg.REDIS_RUNNING_KEY, "1")
         r.set(cfg.REDIS_PID_KEY, str(os.getpid()))
@@ -229,36 +388,52 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             "equity_token_count": len(token_set.equity_tokens),
             "underlying_ltp_tokens": sorted(token_set.ltp_by_underlying_token.keys()),
             "underlying_leg_tokens": sorted(token_set.equity_tokens),
+            "option_chain_store_size": option_chain_store.size(),
             "worker": "hedgium_stream_worker",
         })
 
-        # 6. Start worker threads
-        greeks_thread = threading.Thread(
-            target=_periodic_greeks, name="worker-greeks", daemon=False
+        # 7. Start worker threads
+        thread_greek_update = threading.Thread(
+            target=_greek_update_thread, name="worker-greeks-update", daemon=True
+        )
+        thread_greek_persist = threading.Thread(
+            target=_greek_persist_thread, name="worker-greeks-persist", daemon=True
+        )
+        thread_positions = threading.Thread(
+            target=_positions_thread, name="worker-positions", daemon=True
         )
         tick_thread = threading.Thread(
             target=_tick_worker, name="worker-ticks", daemon=True
         )
-        greeks_thread.start()
+
+        thread_greek_update.start()
+        thread_greek_persist.start()
+        thread_positions.start()
         tick_thread.start()
 
-        # 7. Start adjustment runner
+        # 8. Adjustment runner
         adj_runner: AdjustmentRunner | None = None
         if run_adjustments:
-            adj_runner = AdjustmentRunner(r)
+            adj_runner = AdjustmentRunner(
+                r,
+                positions_manager=positions_manager,
+                option_chain_store=option_chain_store,
+            )
             adj_runner.start()
 
         logger.info(
-            "worker running: %s WS connections, %s tokens (mode=%s)",
-            len(streams), len(all_tokens), cfg.STREAM_MODE,
+            "worker running: %s WS connections, %s tokens, "
+            "chain_store=%s, mode=%s",
+            len(streams), len(all_tokens),
+            option_chain_store.size(), cfg.STREAM_MODE,
         )
         print(
             f"hedgium_stream_worker: {len(streams)} WS, {len(all_tokens)} tokens, "
-            f"mode={cfg.STREAM_MODE}. Ctrl+C to stop.",
+            f"chain_store={option_chain_store.size()}, mode={cfg.STREAM_MODE}. Ctrl+C to stop.",
             flush=True,
         )
 
-        # 8. Session watch loop
+        # 9. Session watch loop
         should_restart = False
         last_reload_t = 0.0
         try:
@@ -298,13 +473,14 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 try:
                     m = json.loads(r.get(cfg.REDIS_META_KEY) or "{}")
                     m["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+                    m["option_chain_store_size"] = option_chain_store.size()
                     r.set(cfg.REDIS_META_KEY, json.dumps(m))
                 except Exception:
                     pass
 
         finally:
-            # Teardown
-            stop_greeks_event.set()
+            stop_threads_event.set()
+            _first_greeks_ready.set()   # unblock persist thread if still in initial wait
             for s in streams:
                 s.stop()
 
@@ -325,11 +501,12 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
 
             tick_q.put(None)
             tick_thread.join(timeout=60.0)
-            greeks_thread.join(timeout=5.0)
+            thread_greek_update.join(timeout=5.0)
+            thread_greek_persist.join(timeout=5.0)
+            thread_positions.join(timeout=5.0)
             if adj_runner:
                 adj_runner.join(timeout=30.0)
 
-            # Clear Redis running flags
             try:
                 m = json.loads(r.get(cfg.REDIS_META_KEY) or "{}")
                 m["stopped_at"] = datetime.now(timezone.utc).isoformat()
@@ -348,33 +525,6 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         break  # clean exit
 
     logger.info("hedgium_stream_worker stopped")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Periodic Greeks helper (reads ticks from Redis, returns bulk-upsert payload)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _collect_greeks_for_bulk_upsert(r, option_tokens: list[int]) -> list[dict]:
-    """
-    For each option token, read the current tick from Redis and return a
-    list of Greek dicts ready for the bulk-upsert endpoint.
-
-    This is a lightweight version — it does NOT do a full BS calculation
-    here; the backend's ``greeks/bulk-upsert`` endpoint already stores
-    mid-price based Greeks.  The heavy BS computation runs inside the Django
-    backend's ``persist_auto_greeks_for_tokens`` — triggered here via the ATM
-    sync call in the tick worker.
-
-    For full Greeks upsert from the worker side, this would use
-    ``adjustments.greeks.get_greeks_for_position``.  Left as a placeholder
-    so the architecture is clear; the ATM-sync call in the tick worker is the
-    primary periodic mechanism.
-    """
-    # Placeholder: actual bulk Greek computation would iterate tokens,
-    # read ticks, compute BS and return [{zerodha_instrument_token, iv, delta, …}].
-    # For now we return empty so the backend persists Greeks via its own
-    # periodic greeks thread (triggered by the ATM sync path).
-    return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────

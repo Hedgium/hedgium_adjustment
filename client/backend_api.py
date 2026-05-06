@@ -65,6 +65,16 @@ def _request(
             )
             if resp.status_code < 500:
                 # 4xx — don't retry; caller decides how to handle
+                if resp.status_code >= 400:
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = {"_raw": resp.text}
+                    logger.warning(
+                        "backend_api: %s %s → %s: %s",
+                        method, url, resp.status_code, body,
+                    )
+                    return {**body, "_status": resp.status_code}
                 try:
                     return resp.json()
                 except Exception:
@@ -128,8 +138,15 @@ def post_greeks_bulk_upsert(greeks: list[dict]) -> dict:
 
     Each item in ``greeks``::
 
-        {"zerodha_instrument_token": int, "iv": float, "delta": float,
-         "gamma": float, "theta": float, "vega": float}
+        {
+          "zerodha_instrument_token": int,
+          "greeks_delta": float | None,
+          "greeks_gamma": float | None,
+          "greeks_vega":  float | None,
+          "greeks_theta": float | None,
+        }
+
+    MANUAL rows are never overwritten by the backend.
     """
     return _request("POST", "greeks/bulk-upsert", json={"greeks": greeks})
 
@@ -142,6 +159,77 @@ def post_atm_sync(underlying_symbols: list[str] | None = None) -> dict:
     if underlying_symbols:
         body["underlying_symbols"] = underlying_symbols
     return _request("POST", "stream/atm-sync", json=body)
+
+
+def get_option_chains(
+    underlying_symbols: list[str] | None = None,
+    mode: str = "auto",
+) -> dict:
+    """
+    Fetch full OptionChain rows for Greek computation.
+
+    ``mode="auto"`` (default) — only rows for open-position expiries ±
+    AUTO_STRIKE_DISTANCE_BUFFER around current positions (same filter as
+    ``GET /internal/stream/config?mode=auto``).
+
+    ``mode="full"`` — every OptionChain row for active-builder underlyings.
+
+    Returns::
+
+        {
+          "option_chains": [
+              {
+                "zerodha_instrument_token": int,
+                "underlying_symbol": str,
+                "strike": float,
+                "option_type": str,
+                "expiry": str,
+                "lot_size": int,
+                "zerodha_tradingsymbol": str,
+                "exchange": str,
+                "strike_distance": int
+              }, ...
+          ],
+          "count": int,
+          "mode": str
+        }
+    """
+    params: dict = {"mode": mode}
+    if underlying_symbols:
+        params["underlying_symbols"] = ",".join(underlying_symbols)
+    return _request("GET", "option-chains/", params=params)
+
+
+def get_live_positions() -> dict:
+    """
+    Fetch live broker positions for master trade-cycle profiles of all active builders,
+    enriched with OptionChain metadata.
+
+    Returns::
+
+        {
+          "positions": [
+              {
+                "tradingsymbol": str,
+                "exchange": str,
+                "instrument_token": int,
+                "underlying_symbol": str | null,
+                "strike": float | null,
+                "option_type": str | null,
+                "expiry": str | null,
+                "lot_size": int,
+                "quantity": int,
+                "product": str,
+                "profile_id": int,
+                "average_price": float | null,
+                "last_price": float | null
+              }, ...
+          ],
+          "count": int,
+          "profiles_fetched": int
+        }
+    """
+    return _request("GET", "positions/live")
 
 
 def get_adjustment_builders() -> dict:

@@ -2,10 +2,12 @@
 Adjustment polling loop for hedgium_stream_worker.
 
 Periodically:
-  1. Fetches active builder configs + open positions from the backend API.
-  2. Reads live LTPs / ticks from shared Redis (written by ws_stream).
-  3. Computes per-position Greeks and aggregates net delta per underlying.
-  4. Sends the snapshot to the backend ``/internal/adjustments/trigger`` endpoint
+  1. Fetches active builder configs from the backend API.
+  2. Replaces book positions with live broker positions via LivePositionsManager
+     (if a positions_manager is provided).
+  3. Reads live LTPs / ticks from shared Redis (written by ws_stream).
+  4. Computes per-position Greeks and aggregates net delta per underlying.
+  5. Sends the snapshot to the backend ``/internal/adjustments/trigger`` endpoint
      which handles delta-band checking, proposal generation, and pushing.
 
 Does NOT need Django or the ORM — all data comes through the HTTP + Redis layer.
@@ -16,6 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Optional
 
 import config as cfg
 from client import backend_api
@@ -31,15 +34,17 @@ class AdjustmentRunner:
     Usage::
 
         r = redis.from_url(cfg.REDIS_URL)
-        runner = AdjustmentRunner(r)
+        runner = AdjustmentRunner(r, positions_manager=pm)
         runner.start()
         ...
         runner.stop()
         runner.join()
     """
 
-    def __init__(self, redis_client):
+    def __init__(self, redis_client, positions_manager=None, option_chain_store=None):
         self._r = redis_client
+        self._positions_manager = positions_manager
+        self._option_chain_store = option_chain_store
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -47,7 +52,7 @@ class AdjustmentRunner:
         self._thread = threading.Thread(
             target=self._loop,
             name="adjustment-runner",
-            daemon=False,
+            daemon=True,
         )
         self._thread.start()
         logger.info("AdjustmentRunner started (interval=%.0fs)", cfg.ADJUSTMENTS_INTERVAL_S)
@@ -89,6 +94,11 @@ class AdjustmentRunner:
             logger.debug("AdjustmentRunner: no active builders")
             return
 
+        # Always fetch fresh live positions before computing Greeks / triggering
+        if self._positions_manager is not None:
+            self._positions_manager.refresh()
+            builders = self._positions_manager.map_to_builders(builders)
+
         logger.info("AdjustmentRunner: processing %s builder(s)", len(builders))
 
         for builder_data in builders:
@@ -97,7 +107,11 @@ class AdjustmentRunner:
             builder_name = builder_data.get("builder_name", "")
 
             try:
-                snap = compute_greeks_for_builder(self._r, builder_data)
+                snap = compute_greeks_for_builder(
+                    self._r,
+                    builder_data,
+                    option_chain_store=self._option_chain_store,
+                )
             except Exception:
                 logger.exception(
                     "AdjustmentRunner: greek computation failed builder_id=%s", builder_id
@@ -142,6 +156,11 @@ class AdjustmentRunner:
                     logger.error(
                         "AdjustmentRunner: builder_id=%s trigger error: %s",
                         builder_id, result.get("message"),
+                    )
+                else:
+                    logger.warning(
+                        "AdjustmentRunner: builder_id=%s unexpected trigger response (status=%s http=%s): %s",
+                        builder_id, status, result.get("_status", "?"), result,
                     )
             except Exception as exc:
                 logger.warning(

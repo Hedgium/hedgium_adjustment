@@ -68,7 +68,7 @@ GREEKS_FULL_INTERVAL_S: float = max(5.0, _env_float("MYSTREAM_GREEKS_FULL_INTERV
 SYNC_ATM_ENABLED: bool = _env("MYSTREAM_SYNC_ATM_ENABLED", "1").lower() not in ("0", "false", "no", "off")
 
 # Minimum seconds between ATM sync calls.
-SYNC_ATM_MIN_INTERVAL_S: float = _env_float("MYSTREAM_SYNC_ATM_MIN_INTERVAL_S", 30.0)
+SYNC_ATM_MIN_INTERVAL_S: float = _env_float("MYSTREAM_SYNC_ATM_MIN_INTERVAL_S", 180.0)
 
 # Kite WebSocket settings.
 WS_PING_TIMEOUT: float = _env_float("MYSTREAM_WS_PING_TIMEOUT", 25.0)
@@ -81,6 +81,15 @@ MAX_WS_CONNECTIONS: int = 3
 # ── Adjustments ───────────────────────────────────────────────────────────────
 # Seconds between each adjustment polling cycle.
 ADJUSTMENTS_INTERVAL_S: float = _env_float("WORKER_ADJUSTMENTS_INTERVAL_S", 60.0)
+
+# Seconds between in-memory Greek refresh (reads Redis ticks, computes BS Greeks).
+GREEKS_UPDATE_INTERVAL_S: float = max(30.0, _env_float("WORKER_GREEKS_UPDATE_INTERVAL_S", 90.0))
+
+# Seconds between persisting computed Greeks to the backend DB (bulk upsert).
+GREEKS_PERSIST_INTERVAL_S: float = max(60.0, _env_float("WORKER_GREEKS_PERSIST_INTERVAL_S", 300.0))
+
+# Seconds between live broker position refresh.
+POSITIONS_REFRESH_INTERVAL_S: float = max(15.0, _env_float("WORKER_POSITIONS_REFRESH_INTERVAL_S", 60.0))
 
 # Greeks pipeline verbose trace.
 GREEKS_PIPELINE_TRACE: bool = _env("GREEKS_PIPELINE_TRACE", "0").lower() not in ("0", "false", "no", "off")
@@ -95,4 +104,7 @@ REDIS_HASH_UNDERLYING_SYMBOL_TOKEN: str = "mystream:underlying_symbol_token"
 REDIS_RUNNING_KEY: str = "mystream:running"
 REDIS_PID_KEY: str = "mystream:pid"
 REDIS_STOP_KEY: str = "mystream:stop"
-REDIS_PERSIST_ENABLED_KEY: str = "mystream:persist_enabled"
+
+# When false, the Greek persist thread skips bulk-upsert calls.
+# Set GREEKS_PERSIST_ENABLED=false in .env to disable without restarting.
+GREEKS_PERSIST_ENABLED: bool = _env("GREEKS_PERSIST_ENABLED", "true").lower() not in ("0", "false", "no", "off")

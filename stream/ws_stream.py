@@ -219,6 +219,49 @@ class KiteQuoteStreamer:
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def update_subscriptions(
+        self,
+        add_tokens: list[int],
+        remove_tokens: list[int],
+    ) -> None:
+        """
+        Dynamically subscribe/unsubscribe tokens on the live WebSocket connection.
+
+        Safe to call from any thread.  If no connection is open (reconnecting)
+        the token list is updated in-place and will take effect on the next
+        ``_on_open`` call.
+        """
+        if remove_tokens:
+            remove_set = set(int(t) for t in remove_tokens)
+            self.tokens = [t for t in self.tokens if t not in remove_set]
+
+        if add_tokens:
+            add_set = set(int(t) for t in add_tokens)
+            existing = set(self.tokens)
+            new_tokens = [t for t in add_set if t not in existing]
+            self.tokens.extend(new_tokens)
+
+        ws = self._ws
+        if ws is None:
+            return
+
+        try:
+            if remove_tokens:
+                ws.send(_subscribe_payload(remove_tokens, action="unsubscribe"))
+                logger.info(
+                    "%s: unsubscribed %s tokens", self.name, len(remove_tokens)
+                )
+            if add_tokens:
+                ws.send(_subscribe_payload(add_tokens, action="subscribe"))
+                ws.send(_mode_payload(add_tokens))
+                logger.info(
+                    "%s: subscribed %s new tokens", self.name, len(add_tokens)
+                )
+        except Exception as exc:
+            logger.warning(
+                "%s: update_subscriptions send error: %s", self.name, exc
+            )
+
     def stop(self):
         self._stop.set()
         if self._ws:
