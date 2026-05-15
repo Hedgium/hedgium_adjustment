@@ -130,21 +130,25 @@ class OptionChainStore:
                 "zerodha_tradingsymbol": row.get("zerodha_tradingsymbol") or "",
                 "exchange": row.get("exchange") or "NFO",
                 "strike_distance": row.get("strike_distance") or 0,
-                # Stored Greeks from backend DB (for MANUAL / AUTO-baseline paths)
+                # DB-sourced fields — only used for the MANUAL path.
+                # AUTO path uses freshly-computed worker values below.
                 "greeks_calculated_by": row.get("greeks_calculated_by") or None,
                 "stored_delta": _f(row.get("greeks_delta")),
                 "stored_gamma": _f(row.get("greeks_gamma")),
                 "stored_vega": _f(row.get("greeks_vega")),
                 "stored_theta": _f(row.get("greeks_theta")),
-                "auto_delta_spot": _f(row.get("auto_delta_spot")),
                 "manual_delta_spot": _f(row.get("manual_delta_spot")),
-                # Freshly computed Greek fields — populated by update_greeks()
+                # Freshly computed Greek fields — populated by update_greeks().
+                # These are the sole source of truth for the AUTO baseline path.
                 "iv": None,
                 "delta": None,
                 "gamma": None,
                 "theta": None,
                 "vega": None,
                 "last_greeks_at": None,
+                # Underlying spot recorded when update_greeks() ran BS.
+                # Used as the reference spot for the gamma-adjusted baseline.
+                "computed_at_spot": None,
             }
 
         with self._lock:
@@ -155,6 +159,11 @@ class OptionChainStore:
     def get_tokens(self) -> list[int]:
         with self._lock:
             return list(self._chains.keys())
+
+    def get_all_rows(self) -> list[dict]:
+        """Return a snapshot of all chain rows (thread-safe copy)."""
+        with self._lock:
+            return [dict(r) for r in self._chains.values()]
 
     def get_chain_by_token(self, token: int) -> Optional[dict]:
         with self._lock:
@@ -241,6 +250,36 @@ class OptionChainStore:
             if spot <= 0:
                 continue
 
+            calc_by = (row.get("greeks_calculated_by") or "").upper()
+
+            # ── MANUAL path ──────────────────────────────────────────────────
+            # Use gamma-adjusted delta from the DB-stored manual values.
+            # No Black-Scholes is run; bid/ask not required.
+            if calc_by == "MANUAL":
+                stored_delta = row.get("stored_delta")
+                if stored_delta is None:
+                    continue
+                stored_gamma = float(row.get("stored_gamma") or 0.0)
+                stored_vega  = float(row.get("stored_vega")  or 0.0)
+                stored_theta = float(row.get("stored_theta") or 0.0)
+                manual_spot  = row.get("manual_delta_spot")
+                if manual_spot is not None:
+                    eff_delta = (spot - float(manual_spot)) * stored_gamma + float(stored_delta)
+                else:
+                    eff_delta = float(stored_delta)
+                updates[token] = {
+                    "iv": 0.0,
+                    "delta": round(eff_delta, 6),
+                    "gamma": round(stored_gamma, 8),
+                    "theta": round(stored_theta, 6),
+                    "vega":  round(stored_vega,  6),
+                    "last_greeks_at": now_iso,
+                    "computed_at_spot": spot,
+                }
+                updated += 1
+                continue
+
+            # ── AUTO path (Black-Scholes) ─────────────────────────────────────
             tick = tick_cache.get(token)
             if not tick:
                 continue
@@ -269,8 +308,9 @@ class OptionChainStore:
                 "delta": round(g["delta"], 6),
                 "gamma": round(g["gamma"], 8),
                 "theta": round(g["theta"], 6),
-                "vega": round(g["vega"], 6),
+                "vega":  round(g["vega"],  6),
                 "last_greeks_at": now_iso,
+                "computed_at_spot": spot,
             }
             updated += 1
 
@@ -297,6 +337,8 @@ class OptionChainStore:
         Return a list of dicts ready for ``POST /internal/greeks/bulk-upsert``.
         Only includes tokens that have successfully computed Greeks.
         Keys match OptionChain model field names (greeks_delta, etc.).
+        Includes ``auto_delta_spot`` so the DB always reflects the spot at
+        which the worker last computed Greeks (prevents stale baseline spot).
         """
         with self._lock:
             rows = list(self._chains.values())
@@ -312,6 +354,7 @@ class OptionChainStore:
                 "greeks_gamma": row.get("gamma"),
                 "greeks_vega":  row.get("vega"),
                 "greeks_theta": row.get("theta"),
+                "auto_delta_spot": row.get("computed_at_spot"),
             })
         return payload
 

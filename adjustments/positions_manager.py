@@ -1,10 +1,17 @@
 """
 Live broker positions manager for the stream worker.
 
-Periodically fetches live positions from the backend (which calls the broker
-API for master trade-cycle profiles), maps them to active builders by
-underlying symbol, and exposes the instrument tokens so that the WebSocket
-subscription set can be updated dynamically.
+Periodically fetches live positions directly from the broker via the
+``GET /internal/positions/live/{profile_id}`` endpoint (one call per
+builder's master profile).  Profile IDs are supplied by the caller from
+the ``adjustments/builders`` response (``master_profile_id`` field).
+
+Falls back to the aggregated ``GET /internal/positions/live`` endpoint if
+no profile IDs are provided.
+
+Maps positions to active builders by underlying symbol and exposes the
+instrument tokens so that the WebSocket subscription set can be updated
+dynamically.
 """
 
 from __future__ import annotations
@@ -31,44 +38,56 @@ class LivePositionsManager:
     Usage::
 
         pm = LivePositionsManager()
-        changed = pm.refresh()          # fetch from backend
+        pm.set_profile_ids([101, 203])   # from adjustments/builders response
+        changed = pm.refresh()           # fetch from broker via backend
         builders_live = pm.map_to_builders(builders_raw)
         new_tokens = pm.get_all_tokens()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, option_chain_store=None) -> None:
         self._lock = threading.Lock()
         self._positions: list[dict] = []
         self._tokens: set[int] = set()
         self._last_signature: str = ""
+        self._profile_ids: list[int] = []
+        self._option_chain_store = option_chain_store
+
+    def set_profile_ids(self, profile_ids: list[int]) -> None:
+        """Update the set of master profile IDs to fetch positions for."""
+        with self._lock:
+            self._profile_ids = list(profile_ids)
 
     # ── public ────────────────────────────────────────────────────────────────
 
     def refresh(self) -> bool:
         """
-        Fetch live positions from the backend and update internal state.
+        Fetch live positions directly from the broker for each master profile
+        and update internal state.
+
+        Each profile is queried via ``GET /internal/positions/live/{profile_id}``
+        which calls the broker API directly (not the DB positions table).
+
+        Falls back to the aggregated ``GET /internal/positions/live`` if no
+        profile IDs have been set yet.
 
         Returns ``True`` if the set of instrument tokens changed (caller should
         then update WebSocket subscriptions), ``False`` otherwise.
         """
-        try:
-            resp = backend_api.get_live_positions()
-        except Exception as exc:
-            logger.warning("LivePositionsManager.refresh: API error: %s", exc)
-            return False
+        with self._lock:
+            profile_ids = list(self._profile_ids)
 
-        raw_positions: list[dict] = resp.get("positions") or []
-        profiles_fetched: int = resp.get("profiles_fetched", 0)
+        if profile_ids:
+            raw_positions = self._fetch_by_profiles(profile_ids)
+        else:
+            # Fallback: use aggregated endpoint (complex builder→TC→profile lookup)
+            raw_positions = self._fetch_aggregated()
 
         if not raw_positions:
-            logger.debug(
-                "LivePositionsManager.refresh: no live positions returned "
-                "(profiles_fetched=%s)", profiles_fetched,
-            )
+            logger.debug("LivePositionsManager.refresh: no live positions returned")
         else:
             logger.info(
                 "LivePositionsManager.refresh: %s live positions across %s profile(s)",
-                len(raw_positions), profiles_fetched,
+                len(raw_positions), len(profile_ids) if profile_ids else "?",
             )
 
         new_tokens: set[int] = set()
@@ -94,6 +113,73 @@ class LivePositionsManager:
                 "LivePositionsManager.refresh: token set changed → %s tokens",
                 len(new_tokens),
             )
+
+    def _fetch_by_profiles(self, profile_ids: list[int]) -> list[dict]:
+        """
+        Call ``GET /internal/positions/live/{profile_id}`` for each profile.
+
+        The per-profile endpoint calls the broker API directly and returns raw
+        net positions (tradingsymbol, quantity, exchange, instrument_token,
+        average_price, last_price, product, …).
+
+        We enrich each position with OptionChain metadata so the result has the
+        same shape that ``map_to_builders`` expects: underlying_symbol, strike,
+        option_type, expiry, lot_size, instrument_token (zerodha).
+        """
+        from client import backend_api as _api
+
+        all_positions: list[dict] = []
+        for pid in profile_ids:
+            try:
+                resp = _api.get_live_positions_for_profile(pid)
+            except Exception as exc:
+                logger.warning(
+                    "LivePositionsManager: profile_id=%s fetch error: %s", pid, exc
+                )
+                continue
+
+            if resp.get("status") == "error" or resp.get("detail"):
+                logger.warning(
+                    "LivePositionsManager: profile_id=%s broker error: %s",
+                    pid, resp.get("detail") or resp.get("status"),
+                )
+                continue
+
+            net = (resp.get("data") or {}).get("net") or []
+            for pos in net:
+                qty = pos.get("quantity") or 0
+                try:
+                    qty = float(qty)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                if qty == 0:
+                    continue
+                p = dict(pos)
+                p["profile_id"] = pid
+                all_positions.append(p)
+
+        if not all_positions:
+            return []
+
+        # Enrich with OptionChain metadata (underlying_symbol, strike, expiry, …)
+        if self._option_chain_store is not None:
+            from optionchain_lookup import enrich_positions_with_option_chain
+            return enrich_positions_with_option_chain(all_positions, self._option_chain_store)
+
+        # If no store yet (e.g. called before first load), fall back to aggregated
+        logger.warning(
+            "LivePositionsManager: no option_chain_store — falling back to aggregated endpoint"
+        )
+        return self._fetch_aggregated()
+
+    def _fetch_aggregated(self) -> list[dict]:
+        """Fallback: use the aggregated backend endpoint (legacy path)."""
+        try:
+            resp = backend_api.get_live_positions()
+        except Exception as exc:
+            logger.warning("LivePositionsManager._fetch_aggregated error: %s", exc)
+            return []
+        return resp.get("positions") or []
 
         return changed
 

@@ -200,31 +200,47 @@ def get_option_chains(
     return _request("GET", "option-chains/", params=params)
 
 
+def get_live_positions_for_profile(profile_id: int) -> dict:
+    """
+    Fetch live broker positions for a single profile directly from the broker
+    API (not the DB positions table).
+
+    Returns the raw broker response::
+
+        {
+          "status": "success" | "error",
+          "data": {
+            "net": [
+                {
+                  "tradingsymbol": str,
+                  "exchange": str,
+                  "instrument_token": int,
+                  "quantity": int | float,
+                  "product": str,
+                  "average_price": float | null,
+                  "last_price": float | null,
+                  ...
+                }, ...
+            ]
+          }
+        }
+    """
+    return _request("GET", f"positions/live/{profile_id}")
+
+
 def get_live_positions() -> dict:
     """
-    Fetch live broker positions for master trade-cycle profiles of all active builders,
-    enriched with OptionChain metadata.
+    Fetch live broker positions for master trade-cycle profiles of all active
+    builders, enriched with OptionChain metadata (fallback / legacy endpoint).
+
+    Prefer ``get_live_positions_for_profile(profile_id)`` when you have the
+    profile id from the builder data, as it calls the broker directly without
+    the intermediary DB enrichment step.
 
     Returns::
 
         {
-          "positions": [
-              {
-                "tradingsymbol": str,
-                "exchange": str,
-                "instrument_token": int,
-                "underlying_symbol": str | null,
-                "strike": float | null,
-                "option_type": str | null,
-                "expiry": str | null,
-                "lot_size": int,
-                "quantity": int,
-                "product": str,
-                "profile_id": int,
-                "average_price": float | null,
-                "last_price": float | null
-              }, ...
-          ],
+          "positions": [...],
           "count": int,
           "profiles_fetched": int
         }
@@ -267,6 +283,7 @@ def post_adjustment_trigger(
     net_delta_by_underlying: dict,
     spot_by_underlying: dict,
     book_positions: list[dict],
+    net_greeks: dict | None = None,
 ) -> dict:
     """
     Send worker-computed Greek snapshot to the backend for full delta-band
@@ -276,14 +293,30 @@ def post_adjustment_trigger(
 
         {"status": "ok"|"pushed"|"skipped"|"error", "push": {...}?, ...}
     """
-    return _request(
-        "POST",
-        "adjustments/trigger",
-        json={
-            "builder_id": builder_id,
-            "strategy_id": strategy_id,
-            "net_delta_by_underlying": net_delta_by_underlying,
-            "spot_by_underlying": spot_by_underlying,
-            "book_positions": book_positions,
-        },
-    )
+    body: dict = {
+        "builder_id": builder_id,
+        "strategy_id": strategy_id,
+        "net_delta_by_underlying": net_delta_by_underlying,
+        "spot_by_underlying": spot_by_underlying,
+        "book_positions": book_positions,
+    }
+    if net_greeks is not None:
+        body["net_greeks"] = net_greeks
+    return _request("POST", "adjustments/trigger", json=body)
+
+
+def post_strategy_spot_snapshot(
+    strategy_id: int,
+    spot_by_underlying: dict[str, float],
+    reason: str | None = None,
+) -> dict:
+    """
+    Persist per-underlying StrategySpot snapshot rows for a strategy.
+    """
+    body: dict = {
+        "strategy_id": strategy_id,
+        "spot_by_underlying": spot_by_underlying,
+    }
+    if reason:
+        body["reason"] = reason
+    return _request("POST", "strategies/spot-snapshots", json=body)

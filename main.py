@@ -160,7 +160,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
 
     # Shared state objects (persist across inner restarts)
     option_chain_store = OptionChainStore()
-    positions_manager = LivePositionsManager()
+    positions_manager = LivePositionsManager(option_chain_store=option_chain_store)
 
     # ── outer restart loop ────────────────────────────────────────────────────
     while not _stop_requested.is_set():
@@ -271,6 +271,20 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 return
             while not stop_threads_event.wait(cfg.POSITIONS_REFRESH_INTERVAL_S):
                 try:
+                    # Sync profile IDs from latest builder list so positions are
+                    # fetched directly from the broker (not the stale DB table).
+                    try:
+                        builders_resp = backend_api.get_adjustment_builders()
+                        profile_ids = [
+                            b["master_profile_id"]
+                            for b in (builders_resp.get("builders") or [])
+                            if b.get("master_profile_id")
+                        ]
+                        if profile_ids:
+                            positions_manager.set_profile_ids(profile_ids)
+                    except Exception:
+                        logger.debug("worker: could not refresh profile IDs for positions")
+
                     changed = positions_manager.refresh()
                     if not changed:
                         continue

@@ -16,6 +16,7 @@ Does NOT need Django or the ORM — all data comes through the HTTP + Redis laye
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from typing import Optional
@@ -47,6 +48,29 @@ class AdjustmentRunner:
         self._option_chain_store = option_chain_store
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # strategy_id -> canonical position signature from previous cycle
+        self._last_positions_sig_by_strategy: dict[int, str] = {}
+
+    @staticmethod
+    def _positions_signature(book_positions: list[dict]) -> str:
+        """
+        Canonical signature of live positions used to detect external changes.
+        """
+        rows: list[tuple] = []
+        for p in book_positions or []:
+            rows.append(
+                (
+                    str(p.get("underlying_symbol") or "").upper(),
+                    str(p.get("option_type") or "").upper(),
+                    str(p.get("expiry") or ""),
+                    float(p.get("strike") or 0.0),
+                    int(p.get("quantity") or 0),
+                    str(p.get("exchange") or ""),
+                    int(p.get("instrument_token") or 0),
+                )
+            )
+        rows.sort()
+        return json.dumps(rows, separators=(",", ":"))
 
     def start(self):
         self._thread = threading.Thread(
@@ -94,8 +118,17 @@ class AdjustmentRunner:
             logger.debug("AdjustmentRunner: no active builders")
             return
 
-        # Always fetch fresh live positions before computing Greeks / triggering
+        # Always fetch fresh live positions before computing Greeks / triggering.
+        # Provide the master_profile_id from each builder so positions are fetched
+        # directly from the broker (not the stale DB positions table).
         if self._positions_manager is not None:
+            profile_ids = [
+                b["master_profile_id"]
+                for b in builders
+                if b.get("master_profile_id")
+            ]
+            if profile_ids:
+                self._positions_manager.set_profile_ids(profile_ids)
             self._positions_manager.refresh()
             builders = self._positions_manager.map_to_builders(builders)
 
@@ -134,12 +167,38 @@ class AdjustmentRunner:
             )
 
             try:
+                sid = int(strategy_id or 0)
+                if sid > 0:
+                    current_sig = self._positions_signature(snap.get("book_positions") or [])
+                    prev_sig = self._last_positions_sig_by_strategy.get(sid)
+                    self._last_positions_sig_by_strategy[sid] = current_sig
+                    # Ignore first-seen snapshot per strategy.
+                    if prev_sig is not None and prev_sig != current_sig:
+                        try:
+                            spot_res = backend_api.post_strategy_spot_snapshot(
+                                strategy_id=sid,
+                                spot_by_underlying=snap.get("spot_by_underlying") or {},
+                                reason="positions_changed_external",
+                            )
+                            logger.info(
+                                "AdjustmentRunner: spot snapshot updated strategy_id=%s res=%s",
+                                sid,
+                                spot_res,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "AdjustmentRunner: spot snapshot update failed strategy_id=%s: %s",
+                                sid,
+                                exc,
+                            )
+
                 result = backend_api.post_adjustment_trigger(
                     builder_id=int(builder_id),
                     strategy_id=int(strategy_id),
                     net_delta_by_underlying=snap["net_delta_by_underlying"],
                     spot_by_underlying=snap["spot_by_underlying"],
                     book_positions=snap["book_positions"],
+                    net_greeks=snap.get("net_greeks"),
                 )
                 status = result.get("status", "unknown")
                 if status == "pushed":

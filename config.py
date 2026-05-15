@@ -94,6 +94,12 @@ POSITIONS_REFRESH_INTERVAL_S: float = max(15.0, _env_float("WORKER_POSITIONS_REF
 # Greeks pipeline verbose trace.
 GREEKS_PIPELINE_TRACE: bool = _env("GREEKS_PIPELINE_TRACE", "0").lower() not in ("0", "false", "no", "off")
 
+# Age (seconds) beyond which in-memory Greeks are considered stale for the
+# adjustment check.  If the last update_greeks() run was older than this,
+# get_greeks_for_position() falls back to fresh Black-Scholes.
+# Should be at least WORKER_GREEKS_UPDATE_INTERVAL_S + some buffer.
+GREEKS_STALE_THRESHOLD_S: float = _env_float("WORKER_GREEKS_STALE_THRESHOLD_S", 300.0)
+
 # ── Redis key schema (must match backend optionchain/mystream/constants.py) ───
 REDIS_TICKS_HASH: str = _env("MYSTREAM_TICKS_HASH", "mystream:ticks")
 REDIS_TICKS_HASH_FALLBACK: str = _env("MYSTREAM_TICKS_HASH_FALLBACK", "")
