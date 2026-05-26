@@ -197,9 +197,6 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         # ── Greek update thread ───────────────────────────────────────────────
         def _greek_update_thread():
             logger.info("worker: Greek update thread started (interval=%.0fs)", cfg.GREEKS_UPDATE_INTERVAL_S)
-            # Initial delay — let the WS stream warm up
-            if stop_threads_event.wait(min(10.0, cfg.GREEKS_UPDATE_INTERVAL_S)):
-                return
             while not stop_threads_event.wait(cfg.GREEKS_UPDATE_INTERVAL_S):
                 # Re-fetch option chain metadata every cycle so that backend
                 # changes (e.g. switching source to MANUAL, strike updates) are
@@ -406,6 +403,25 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             "worker": "hedgium_stream_worker",
         })
 
+        # 6b. Bootstrap Greeks from live ticks before adjustments run
+        if option_chain_store.size():
+            try:
+                boot_updated = option_chain_store.update_greeks(r, credentials)
+                logger.info(
+                    "worker: Greek bootstrap — updated=%s/%s",
+                    boot_updated, option_chain_store.size(),
+                )
+            except Exception:
+                logger.exception("worker: Greek bootstrap failed")
+        if option_chain_store.has_fresh_greeks():
+            _first_greeks_ready.set()
+            logger.info("worker: Greek bootstrap ready — adjustments may run")
+        else:
+            logger.warning(
+                "worker: Greek bootstrap incomplete — adjustments blocked until "
+                "first successful Greek update"
+            )
+
         # 7. Start worker threads
         thread_greek_update = threading.Thread(
             target=_greek_update_thread, name="worker-greeks-update", daemon=True
@@ -432,6 +448,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 r,
                 positions_manager=positions_manager,
                 option_chain_store=option_chain_store,
+                greeks_ready=_first_greeks_ready,
             )
             adj_runner.start()
 

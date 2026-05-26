@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from decouple import config as _cfg, UndefinedValueError
 
-
 def _env(key: str, default: str = "") -> str:
     try:
         return (_cfg(key, default=default) or "").strip()
@@ -99,6 +98,11 @@ GREEKS_PIPELINE_TRACE: bool = _env("GREEKS_PIPELINE_TRACE", "0").lower() not in 
 # get_greeks_for_position() falls back to fresh Black-Scholes.
 # Should be at least WORKER_GREEKS_UPDATE_INTERVAL_S + some buffer.
 GREEKS_STALE_THRESHOLD_S: float = _env_float("WORKER_GREEKS_STALE_THRESHOLD_S", 300.0)
+
+# Max seconds the adjustment runner waits for the first Greek bootstrap at startup.
+GREEKS_BOOTSTRAP_TIMEOUT_S: float = max(
+    120.0, _env_float("WORKER_GREEKS_BOOTSTRAP_TIMEOUT_S", 180.0)
+)
 
 # ── Redis key schema (must match backend optionchain/mystream/constants.py) ───
 REDIS_TICKS_HASH: str = _env("MYSTREAM_TICKS_HASH", "mystream:ticks")

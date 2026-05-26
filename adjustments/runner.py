@@ -42,10 +42,17 @@ class AdjustmentRunner:
         runner.join()
     """
 
-    def __init__(self, redis_client, positions_manager=None, option_chain_store=None):
+    def __init__(
+        self,
+        redis_client,
+        positions_manager=None,
+        option_chain_store=None,
+        greeks_ready: threading.Event | None = None,
+    ):
         self._r = redis_client
         self._positions_manager = positions_manager
         self._option_chain_store = option_chain_store
+        self._greeks_ready = greeks_ready
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # strategy_id -> canonical position signature from previous cycle
@@ -94,7 +101,21 @@ class AdjustmentRunner:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _loop(self):
+        if self._greeks_ready is not None:
+            logger.info(
+                "AdjustmentRunner: waiting for Greek bootstrap (timeout=%.0fs)…",
+                cfg.GREEKS_BOOTSTRAP_TIMEOUT_S,
+            )
+            if not self._greeks_ready.wait(timeout=cfg.GREEKS_BOOTSTRAP_TIMEOUT_S):
+                logger.warning(
+                    "AdjustmentRunner: Greek bootstrap not ready after %.0fs — "
+                    "skipping cycles until Greeks are available",
+                    cfg.GREEKS_BOOTSTRAP_TIMEOUT_S,
+                )
         while not self._stop_event.wait(cfg.ADJUSTMENTS_INTERVAL_S):
+            if self._greeks_ready is not None and not self._greeks_ready.is_set():
+                logger.debug("AdjustmentRunner: Greeks not ready — skipping cycle")
+                continue
             try:
                 self._run_once()
             except Exception:

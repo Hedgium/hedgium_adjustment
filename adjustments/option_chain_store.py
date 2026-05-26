@@ -29,6 +29,44 @@ DEFAULT_RISK_FREE_RATE = 0.065
 _KITE_BATCH_SIZE = 500
 
 
+def _float_or_none(v) -> Optional[float]:
+    return float(v) if v is not None else None
+
+
+def _iso_or_none(v) -> Optional[str]:
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def _seed_computed_from_db_row(entry: dict, row: dict) -> None:
+    """
+    Seed worker computed Greek fields from persisted OptionChain DB values so
+    gamma-adjusted adjustments work before the first update_greeks() cycle.
+    """
+    calc_by = (row.get("greeks_calculated_by") or "").upper()
+    db_delta = _float_or_none(row.get("greeks_delta"))
+    if db_delta is None:
+        return
+
+    if calc_by == "MANUAL":
+        ref_spot = _float_or_none(row.get("manual_delta_spot"))
+    else:
+        ref_spot = _float_or_none(row.get("auto_delta_spot"))
+
+    if ref_spot is None:
+        return
+
+    entry["delta"] = db_delta
+    entry["gamma"] = _float_or_none(row.get("greeks_gamma"))
+    entry["theta"] = _float_or_none(row.get("greeks_theta"))
+    entry["vega"] = _float_or_none(row.get("greeks_vega"))
+    entry["computed_at_spot"] = ref_spot
+    entry["last_greeks_at"] = _iso_or_none(row.get("greeks_updated_at"))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Black-Scholes helpers (mirrors adjustments/greeks.py but self-contained)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,6 +134,14 @@ class OptionChainStore:
 
     # ── public ────────────────────────────────────────────────────────────────
 
+    # Computed Greek fields written by update_greeks().
+    # Preserved across load() reloads so the race window between load() and
+    # the next update_greeks() cycle does not blank live Greek data.
+    _COMPUTED_FIELDS = (
+        "iv", "delta", "gamma", "theta", "vega",
+        "last_greeks_at", "computed_at_spot",
+    )
+
     def load(self, chains_data: list[dict]) -> None:
         """
         Replace the in-memory chain store with rows from the backend API.
@@ -104,6 +150,11 @@ class OptionChainStore:
 
             zerodha_instrument_token, underlying_symbol, strike,
             option_type, expiry (ISO str), lot_size
+
+        On reload (store already has data), previously-computed Greek values
+        are carried over for tokens that survive the reload so that callers
+        always see fresh Greeks rather than a brief None window between load()
+        and the next update_greeks() run.
         """
         new: dict[int, dict] = {}
         for row in chains_data:
@@ -116,9 +167,6 @@ class OptionChainStore:
                 expiry = date.fromisoformat(expiry_raw) if expiry_raw else None
             except (ValueError, TypeError):
                 expiry = None
-
-            def _f(v):
-                return float(v) if v is not None else None
 
             new[tok] = {
                 "zerodha_instrument_token": tok,
@@ -133,25 +181,35 @@ class OptionChainStore:
                 # DB-sourced fields — only used for the MANUAL path.
                 # AUTO path uses freshly-computed worker values below.
                 "greeks_calculated_by": row.get("greeks_calculated_by") or None,
-                "stored_delta": _f(row.get("greeks_delta")),
-                "stored_gamma": _f(row.get("greeks_gamma")),
-                "stored_vega": _f(row.get("greeks_vega")),
-                "stored_theta": _f(row.get("greeks_theta")),
-                "manual_delta_spot": _f(row.get("manual_delta_spot")),
+                "stored_delta": _float_or_none(row.get("greeks_delta")),
+                "stored_gamma": _float_or_none(row.get("greeks_gamma")),
+                "stored_vega": _float_or_none(row.get("greeks_vega")),
+                "stored_theta": _float_or_none(row.get("greeks_theta")),
+                "manual_delta_spot": _float_or_none(row.get("manual_delta_spot")),
                 # Freshly computed Greek fields — populated by update_greeks().
-                # These are the sole source of truth for the AUTO baseline path.
+                # Seeded from DB on load when persisted baseline exists.
                 "iv": None,
                 "delta": None,
                 "gamma": None,
                 "theta": None,
                 "vega": None,
                 "last_greeks_at": None,
-                # Underlying spot recorded when update_greeks() ran BS.
-                # Used as the reference spot for the gamma-adjusted baseline.
                 "computed_at_spot": None,
             }
+            _seed_computed_from_db_row(new[tok], row)
 
         with self._lock:
+            # Carry over previously-computed Greeks for tokens that survive the
+            # reload.  This prevents a brief None window (and unwanted BS
+            # fallback) between this load() call and the next update_greeks().
+            old = self._chains
+            for tok, entry in new.items():
+                prev = old.get(tok)
+                if prev is None:
+                    continue
+                for field in self._COMPUTED_FIELDS:
+                    if prev.get(field) is not None:
+                        entry[field] = prev[field]
             self._chains = new
 
         logger.info("OptionChainStore: loaded %s rows", len(new))
@@ -173,6 +231,24 @@ class OptionChainStore:
     def size(self) -> int:
         with self._lock:
             return len(self._chains)
+
+    def has_fresh_greeks(self) -> bool:
+        """True if at least one row has a non-stale gamma-adjustment baseline."""
+        with self._lock:
+            rows = list(self._chains.values())
+        for row in rows:
+            if row.get("delta") is None or row.get("computed_at_spot") is None:
+                continue
+            last_at = row.get("last_greeks_at")
+            if not last_at:
+                continue
+            try:
+                age_s = (datetime.utcnow() - datetime.fromisoformat(last_at)).total_seconds()
+                if age_s <= cfg.GREEKS_STALE_THRESHOLD_S:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def update_greeks(self, r, credentials: dict) -> int:
         """
