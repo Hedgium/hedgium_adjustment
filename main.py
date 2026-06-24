@@ -127,7 +127,10 @@ def _load_option_chains(
             )
             resp = backend_api.get_option_chains(underlying_symbols or None, mode="full")
             chains = resp.get("option_chains") or []
-        option_chain_store.load(chains)
+        option_chain_store.load(
+            chains,
+            dividend_by_underlying=resp.get("dividend_by_underlying") or {},
+        )
         logger.info(
             "worker: option chain store loaded %s rows (mode=%s)",
             len(chains), resp.get("mode", "?"),

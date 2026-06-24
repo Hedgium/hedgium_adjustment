@@ -19,6 +19,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config as cfg
+from adjustments.dividend import effective_spot_for_greeks
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,7 @@ class OptionChainStore:
         self._lock = threading.Lock()
         # keyed by zerodha_instrument_token
         self._chains: dict[int, dict] = {}
+        self._dividend_by_underlying: dict[str, dict] = {}
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -142,7 +144,11 @@ class OptionChainStore:
         "last_greeks_at", "computed_at_spot",
     )
 
-    def load(self, chains_data: list[dict]) -> None:
+    def load(
+        self,
+        chains_data: list[dict],
+        dividend_by_underlying: Optional[dict[str, dict]] = None,
+    ) -> None:
         """
         Replace the in-memory chain store with rows from the backend API.
 
@@ -211,6 +217,8 @@ class OptionChainStore:
                     if prev.get(field) is not None:
                         entry[field] = prev[field]
             self._chains = new
+            if dividend_by_underlying is not None:
+                self._dividend_by_underlying = dict(dividend_by_underlying)
 
         logger.info("OptionChainStore: loaded %s rows", len(new))
 
@@ -263,6 +271,7 @@ class OptionChainStore:
         """
         with self._lock:
             chains_snapshot = dict(self._chains)
+            dividend_map = dict(self._dividend_by_underlying)
 
         if not chains_snapshot:
             return 0
@@ -322,9 +331,12 @@ class OptionChainStore:
             if not expiry or strike is None or not option_type or not underlying:
                 continue
 
-            spot = spot_cache.get(underlying, 0.0)
-            if spot <= 0:
+            spot_raw = spot_cache.get(underlying, 0.0)
+            if spot_raw <= 0:
                 continue
+
+            div_cfg = dividend_map.get(underlying)
+            spot = effective_spot_for_greeks(spot_raw, expiry, div_cfg)
 
             calc_by = (row.get("greeks_calculated_by") or "").upper()
 
@@ -350,7 +362,7 @@ class OptionChainStore:
                     "theta": round(stored_theta, 6),
                     "vega":  round(stored_vega,  6),
                     "last_greeks_at": now_iso,
-                    "computed_at_spot": spot,
+                    "computed_at_spot": spot_raw,
                 }
                 updated += 1
                 continue
@@ -386,7 +398,7 @@ class OptionChainStore:
                 "theta": round(g["theta"], 6),
                 "vega":  round(g["vega"],  6),
                 "last_greeks_at": now_iso,
-                "computed_at_spot": spot,
+                "computed_at_spot": spot_raw,
             }
             updated += 1
 

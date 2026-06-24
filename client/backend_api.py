@@ -190,6 +190,13 @@ def get_option_chains(
                 "strike_distance": int
               }, ...
           ],
+          "dividend_by_underlying": {
+              "HINDZINC": {
+                  "active": bool,
+                  "amount": float | null,
+                  "ex_dividend_date": str | null
+              }, ...
+          },
           "count": int,
           "mode": str
         }
@@ -254,7 +261,21 @@ def get_adjustment_builders() -> dict:
 
     Returns::
 
-        {"builders": [...], "count": int}
+        {
+          "builders": [
+              {
+                  ...,
+                  "dividend_by_underlying": {
+                      "SYMBOL": {
+                          "active": bool,
+                          "amount": float | null,
+                          "ex_dividend_date": str | null
+                      }, ...
+                  }
+              }, ...
+          ],
+          "count": int
+        }
     """
     return _request("GET", "adjustments/builders")
 

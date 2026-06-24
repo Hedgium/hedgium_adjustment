@@ -21,6 +21,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import config as cfg
+from adjustments.dividend import effective_spot_for_greeks
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,7 @@ def get_greeks_for_position(
     quantity: int,
     instrument_label: str,
     stored_chain: Optional[dict] = None,
+    dividend: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Compute net Greeks for one position for the adjustment check.
@@ -157,7 +159,8 @@ def get_greeks_for_position(
     if quantity == 0:
         return None
 
-    S = float(underlying_spot)
+    S_raw = float(underlying_spot)
+    S = effective_spot_for_greeks(S_raw, expiry, dividend)
 
     # Always fetch tick — needed for bid/ask/ltp output and BS fallback.
     tick = fetch_tick_by_token(r, tok)
@@ -332,6 +335,8 @@ def compute_greeks_for_builder(
     if not positions:
         return None
 
+    dividend_by_underlying: dict = builder_data.get("dividend_by_underlying") or {}
+
     # Build underlying→token map from legs
     leg_token_by_symbol: dict[str, int] = {}
     for leg in legs:
@@ -395,6 +400,7 @@ def compute_greeks_for_builder(
             quantity=int(quantity),
             instrument_label=instrument,
             stored_chain=stored_chain,
+            dividend=dividend_by_underlying.get(under),
         )
 
         if greeks is None:
