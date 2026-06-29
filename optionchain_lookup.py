@@ -30,26 +30,27 @@ def enrich_positions_with_option_chain(
     """
     Attach OptionChain metadata to each raw broker position.
 
-    Lookup order for each position's ``tradingsymbol``:
-    1. ``zerodha_tradingsymbol`` in the store (exact, case-insensitive)
+    Lookup is attempted against all three broker tradingsymbol variants stored
+    in the OptionChainStore (zerodha, shoonya, kotakneo) so that positions from
+    any broker type are correctly enriched.  Without this, non-Zerodha positions
+    return ``underlying_symbol=None`` and are invisible to Greek computation.
 
     Adds the following keys to each position (``None`` if not found):
-    - ``instrument_token`` (zerodha)
+    - ``instrument_token``  — always the **Zerodha** token for Redis tick lookup
     - ``underlying_symbol``
     - ``strike``
     - ``option_type``
     - ``expiry``  (ISO date string)
     - ``lot_size``
     - ``zerodha_tradingsymbol``
-
-    Also normalises ``broker_name`` if the caller set it, otherwise leaves it.
     """
-    # Build tradingsymbol → chain row lookup from the in-memory store
+    # Build a unified tradingsymbol → chain-row index covering every broker format.
     ts_index: dict[str, dict] = {}
     for row in store.get_all_rows():
-        ts = (row.get("zerodha_tradingsymbol") or "").strip().upper()
-        if ts and ts not in ts_index:
-            ts_index[ts] = row
+        for field in ("zerodha_tradingsymbol", "shoonya_tradingsymbol", "kotakneo_tradingsymbol"):
+            ts = (row.get(field) or "").strip().upper()
+            if ts and ts not in ts_index:
+                ts_index[ts] = row
 
     enriched: list[dict] = []
     for pos in positions:
@@ -59,7 +60,9 @@ def enrich_positions_with_option_chain(
         p = dict(pos)
         if chain:
             expiry = chain.get("expiry")
-            p.setdefault("instrument_token", chain.get("zerodha_instrument_token"))
+            # Always use the Zerodha token so Redis tick lookups work regardless
+            # of which broker placed the position.
+            p["instrument_token"] = chain.get("zerodha_instrument_token")
             p["underlying_symbol"] = (chain.get("underlying_symbol") or "").upper() or None
             p["strike"] = float(chain["strike"]) if chain.get("strike") is not None else None
             p["option_type"] = chain.get("option_type")
@@ -67,8 +70,10 @@ def enrich_positions_with_option_chain(
             p["lot_size"] = int(chain.get("lot_size") or 1)
             p["zerodha_tradingsymbol"] = chain.get("zerodha_tradingsymbol") or ""
         else:
-            logger.debug(
-                "optionchain_lookup: no OptionChain match for tradingsymbol=%r", ts_key
+            logger.warning(
+                "optionchain_lookup: no OptionChain match for tradingsymbol=%r "
+                "(position will be excluded from Greek computation)",
+                ts_key,
             )
             p.setdefault("instrument_token", None)
             p.setdefault("underlying_symbol", None)

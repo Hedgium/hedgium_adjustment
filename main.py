@@ -275,19 +275,17 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                     # fetched directly from the broker (not the stale DB table).
                     try:
                         builders_resp = backend_api.get_adjustment_builders()
-                        profile_ids = [
+                        profile_ids = list(dict.fromkeys(
                             b["master_profile_id"]
                             for b in (builders_resp.get("builders") or [])
                             if b.get("master_profile_id")
-                        ]
+                        ))
                         if profile_ids:
                             positions_manager.set_profile_ids(profile_ids)
                     except Exception:
                         logger.debug("worker: could not refresh profile IDs for positions")
 
-                    changed = positions_manager.refresh()
-                    if not changed:
-                        continue
+                    positions_manager.refresh()
 
                     new_live_tokens = positions_manager.get_all_tokens()
                     with current_tokens_lock:
@@ -300,9 +298,17 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                         continue
 
                     logger.info(
-                        "worker: live positions changed → subscribing %s new tokens",
+                        "worker: live positions changed → %s new tokens; "
+                        "reloading option chains and subscribing",
                         len(add_tokens),
                     )
+
+                    # Reload option chains immediately so new position tokens
+                    # get Greek baselines before the next adjustment cycle.
+                    try:
+                        _load_option_chains(option_chain_store)
+                    except Exception:
+                        logger.exception("worker: option chain reload after new positions failed")
 
                     # Distribute new tokens across streams
                     total_per_stream = cfg.MAX_INSTRUMENTS_PER_WS

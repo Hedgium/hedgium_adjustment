@@ -182,6 +182,8 @@ class OptionChainStore:
                 "expiry": expiry,
                 "lot_size": int(row.get("lot_size") or 1),
                 "zerodha_tradingsymbol": row.get("zerodha_tradingsymbol") or "",
+                "shoonya_tradingsymbol": row.get("shoonya_tradingsymbol") or "",
+                "kotakneo_tradingsymbol": row.get("kotakneo_tradingsymbol") or "",
                 "exchange": row.get("exchange") or "NFO",
                 "strike_distance": row.get("strike_distance") or 0,
                 # DB-sourced fields — only used for the MANUAL path.

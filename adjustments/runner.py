@@ -143,11 +143,11 @@ class AdjustmentRunner:
         # Provide the master_profile_id from each builder so positions are fetched
         # directly from the broker (not the stale DB positions table).
         if self._positions_manager is not None:
-            profile_ids = [
+            profile_ids = list(dict.fromkeys(
                 b["master_profile_id"]
                 for b in builders
                 if b.get("master_profile_id")
-            ]
+            ))
             if profile_ids:
                 self._positions_manager.set_profile_ids(profile_ids)
             self._positions_manager.refresh()
@@ -179,13 +179,13 @@ class AdjustmentRunner:
                 )
                 continue
 
-            logger.info(
-                "AdjustmentRunner: builder_id=%s strategy_id=%s net_delta_by_u=%s spots=%s",
-                builder_id,
-                strategy_id,
-                snap["net_delta_by_underlying"],
-                {u: round(v, 2) for u, v in snap["spot_by_underlying"].items()},
-            )
+            # logger.info(
+            #     "AdjustmentRunner: builder_id=%s strategy_id=%s net_delta_by_u=%s spots=%s",
+            #     builder_id,
+            #     strategy_id,
+            #     snap["net_delta_by_underlying"],
+            #     {u: round(v, 2) for u, v in snap["spot_by_underlying"].items()},
+            # )
 
             try:
                 sid = int(strategy_id or 0)

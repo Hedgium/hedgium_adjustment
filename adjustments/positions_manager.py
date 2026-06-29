@@ -114,6 +114,8 @@ class LivePositionsManager:
                 len(new_tokens),
             )
 
+        return changed
+
     def _fetch_by_profiles(self, profile_ids: list[int]) -> list[dict]:
         """
         Call ``GET /internal/positions/live/{profile_id}`` for each profile.
@@ -129,9 +131,10 @@ class LivePositionsManager:
         from client import backend_api as _api
 
         all_positions: list[dict] = []
-        for pid in profile_ids:
+        for pid in dict.fromkeys(profile_ids):  # deduplicate, preserving order
             try:
                 resp = _api.get_live_positions_for_profile(pid)
+
             except Exception as exc:
                 logger.warning(
                     "LivePositionsManager: profile_id=%s fetch error: %s", pid, exc
@@ -180,8 +183,6 @@ class LivePositionsManager:
             logger.warning("LivePositionsManager._fetch_aggregated error: %s", exc)
             return []
         return resp.get("positions") or []
-
-        return changed
 
     def get_all_tokens(self) -> set[int]:
         """Return the set of all instrument tokens from live positions."""
@@ -236,16 +237,22 @@ class LivePositionsManager:
             if matched:
                 # Normalize live positions into the same shape as book positions
                 b["positions"] = [_normalize_live_position(pos) for pos in matched]
-                logger.debug(
+                logger.info(
                     "LivePositionsManager.map_to_builders: builder_id=%s → "
-                    "%s live positions (underlyings=%s)",
+                    "%s live positions matched (underlyings=%s)",
                     b.get("builder_id"), len(matched), sorted(underlyings),
                 )
             else:
-                logger.debug(
+                unenriched = sum(
+                    1 for p in live_positions
+                    if not (p.get("underlying_symbol") or "").strip()
+                )
+                logger.warning(
                     "LivePositionsManager.map_to_builders: builder_id=%s — "
-                    "no live match for underlyings=%s, keeping book positions",
+                    "no live match for underlyings=%s "
+                    "(live_total=%s unenriched=%s) → keeping DB book positions",
                     b.get("builder_id"), sorted(underlyings),
+                    len(live_positions), unenriched,
                 )
 
             result.append(b)

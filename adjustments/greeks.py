@@ -247,10 +247,10 @@ def get_greeks_for_position(
     aq   = abs(q)
 
     # logger.info(
-    #     "greeks_for_position: %s tok:%s bid:%s ask:%s ltp:%s mid:%s iv:%s "
-    #     "delta:%s net_delta:%s qty:%s",
-    #     instrument_label, tok, bid, ask, ltp, mid, iv_val,
-    #     delta_pu, round(delta_pu * aq * sign, 6), q,
+    #     "greeks[pos]: %s tok=%s qty=%s bid=%.4f ask=%.4f ltp=%.4f mid=%.4f "
+    #     "delta=%.6f net_delta=%.6f path=%s",
+    #     instrument_label, tok, q, bid, ask, ltp, mid,
+    #     delta_pu, round(delta_pu * aq * sign, 6), path,
     # )
 
     return {
@@ -450,11 +450,17 @@ def compute_greeks_for_builder(
 
     underlyings = sorted(nd_by_u.keys())
 
-    if cfg.GREEKS_PIPELINE_TRACE:
-        logger.info(
-            "[greeks-pipeline] builder_id=%s strategy_id=%s net_delta_by_u=%s per_leg=%s",
-            builder_id, strategy_id, net_delta_by_underlying, len(per_leg),
-        )
+    logger.info(
+        "[net-delta] builder_id=%s strategy_id=%s legs=%s "
+        "net_delta_by_underlying=%s net_gamma=%.6f spot=%s",
+        builder_id,
+        strategy_id,
+        len(per_leg),
+        {u: round(v, 4) for u, v in net_delta_by_underlying.items()},
+        net_greeks.get("net_gamma", 0.0),
+        {u: round(v, 2) for u, v in spot_out.items()},
+    )
+
 
     return {
         "builder_id": builder_id,
