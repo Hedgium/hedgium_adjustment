@@ -164,6 +164,7 @@ def post_atm_sync(underlying_symbols: list[str] | None = None) -> dict:
 def get_option_chains(
     underlying_symbols: list[str] | None = None,
     mode: str = "auto",
+    include_tradingsymbols: list[str] | None = None,
 ) -> dict:
     """
     Fetch full OptionChain rows for Greek computation.
@@ -204,7 +205,25 @@ def get_option_chains(
     params: dict = {"mode": mode}
     if underlying_symbols:
         params["underlying_symbols"] = ",".join(underlying_symbols)
+    if include_tradingsymbols:
+        params["include_tradingsymbols"] = ",".join(include_tradingsymbols)
     return _request("GET", "option-chains/", params=params)
+
+
+def lookup_option_chains_by_tradingsymbols(tradingsymbols: list[str]) -> dict:
+    """
+    Fetch OptionChain rows for specific broker tradingsymbols (any broker format).
+
+    Used when live positions reference contracts outside the auto-mode store window.
+    """
+    symbols = [s.strip() for s in tradingsymbols if (s or "").strip()]
+    if not symbols:
+        return {"option_chains": [], "count": 0}
+    return _request(
+        "GET",
+        "option-chains/lookup",
+        params={"tradingsymbols": ",".join(symbols)},
+    )
 
 
 def get_live_positions_for_profile(profile_id: int) -> dict:

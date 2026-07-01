@@ -6,6 +6,10 @@ This module builds a secondary index keyed by every known trading-symbol
 variant so that cross-broker positions (Shoonya, KotakNeo) can be looked up
 by ``tradingsymbol``.
 
+When a live position's tradingsymbol is not in the auto-filtered store
+(subset loaded via ``mode=auto``), rows are fetched from the backend DB via
+``GET /internal/option-chains/lookup`` and merged into the store.
+
 Usage::
 
     from optionchain_lookup import enrich_positions_with_option_chain
@@ -23,6 +27,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _build_tradingsymbol_index(store: "OptionChainStore") -> dict[str, dict]:
+    ts_index: dict[str, dict] = {}
+    for row in store.get_all_rows():
+        for field in ("zerodha_tradingsymbol", "shoonya_tradingsymbol", "kotakneo_tradingsymbol"):
+            ts = (row.get(field) or "").strip().upper()
+            if ts and ts not in ts_index:
+                ts_index[ts] = row
+    return ts_index
+
+
+def _fetch_missing_rows_from_backend(missing_symbols: list[str]) -> list[dict]:
+    from client import backend_api
+
+    try:
+        resp = backend_api.lookup_option_chains_by_tradingsymbols(missing_symbols)
+        return resp.get("option_chains") or []
+    except Exception:
+        logger.exception(
+            "optionchain_lookup: backend lookup failed for %s symbol(s)",
+            len(missing_symbols),
+        )
+        return []
+
+
 def enrich_positions_with_option_chain(
     positions: list[dict],
     store: "OptionChainStore",
@@ -32,8 +60,9 @@ def enrich_positions_with_option_chain(
 
     Lookup is attempted against all three broker tradingsymbol variants stored
     in the OptionChainStore (zerodha, shoonya, kotakneo) so that positions from
-    any broker type are correctly enriched.  Without this, non-Zerodha positions
-    return ``underlying_symbol=None`` and are invisible to Greek computation.
+    any broker type are correctly enriched.  Symbols missing from the store
+    (e.g. outside auto-mode strike window) are fetched from the backend DB and
+    merged into the store.
 
     Adds the following keys to each position (``None`` if not found):
     - ``instrument_token``  — always the **Zerodha** token for Redis tick lookup
@@ -44,13 +73,24 @@ def enrich_positions_with_option_chain(
     - ``lot_size``
     - ``zerodha_tradingsymbol``
     """
-    # Build a unified tradingsymbol → chain-row index covering every broker format.
-    ts_index: dict[str, dict] = {}
-    for row in store.get_all_rows():
-        for field in ("zerodha_tradingsymbol", "shoonya_tradingsymbol", "kotakneo_tradingsymbol"):
-            ts = (row.get(field) or "").strip().upper()
-            if ts and ts not in ts_index:
-                ts_index[ts] = row
+    ts_index = _build_tradingsymbol_index(store)
+
+    missing: list[str] = []
+    for pos in positions:
+        ts_key = (pos.get("tradingsymbol") or "").strip().upper()
+        if ts_key and ts_key not in ts_index:
+            missing.append(ts_key)
+
+    if missing:
+        fetched = _fetch_missing_rows_from_backend(missing)
+        if fetched:
+            store.merge_rows(fetched)
+            ts_index = _build_tradingsymbol_index(store)
+            logger.info(
+                "optionchain_lookup: merged %s row(s) from backend for %s missing symbol(s)",
+                len(fetched),
+                len(missing),
+            )
 
     enriched: list[dict] = []
     for pos in positions:
@@ -60,8 +100,6 @@ def enrich_positions_with_option_chain(
         p = dict(pos)
         if chain:
             expiry = chain.get("expiry")
-            # Always use the Zerodha token so Redis tick lookups work regardless
-            # of which broker placed the position.
             p["instrument_token"] = chain.get("zerodha_instrument_token")
             p["underlying_symbol"] = (chain.get("underlying_symbol") or "").upper() or None
             p["strike"] = float(chain["strike"]) if chain.get("strike") is not None else None

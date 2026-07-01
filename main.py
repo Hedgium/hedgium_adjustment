@@ -110,6 +110,7 @@ def _wait_for_tokens(credentials: dict):
 def _load_option_chains(
     option_chain_store: OptionChainStore,
     underlying_symbols: list[str] | None = None,
+    include_tradingsymbols: list[str] | None = None,
 ) -> None:
     """
     Fetch full OptionChain rows from backend and load into the store.
@@ -119,13 +120,21 @@ def _load_option_chains(
     always seeded and Greeks can be computed for the entire subscribed universe.
     """
     try:
-        resp = backend_api.get_option_chains(underlying_symbols or None, mode="auto")
+        resp = backend_api.get_option_chains(
+            underlying_symbols or None,
+            mode="auto",
+            include_tradingsymbols=include_tradingsymbols,
+        )
         chains = resp.get("option_chains") or []
         if not chains:
             logger.info(
                 "worker: option-chains auto mode returned 0 rows — falling back to mode=full"
             )
-            resp = backend_api.get_option_chains(underlying_symbols or None, mode="full")
+            resp = backend_api.get_option_chains(
+                underlying_symbols or None,
+                mode="full",
+                include_tradingsymbols=include_tradingsymbols,
+            )
             chains = resp.get("option_chains") or []
         option_chain_store.load(
             chains,
@@ -205,7 +214,10 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 # changes (e.g. switching source to MANUAL, strike updates) are
                 # picked up automatically without restarting the worker.
                 try:
-                    _load_option_chains(option_chain_store)
+                    _load_option_chains(
+                        option_chain_store,
+                        include_tradingsymbols=positions_manager.get_tradingsymbols() or None,
+                    )
                 except Exception:
                     logger.exception("worker: option chain reload error")
 
@@ -306,7 +318,10 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                     # Reload option chains immediately so new position tokens
                     # get Greek baselines before the next adjustment cycle.
                     try:
-                        _load_option_chains(option_chain_store)
+                        _load_option_chains(
+                            option_chain_store,
+                            include_tradingsymbols=positions_manager.get_tradingsymbols() or None,
+                        )
                     except Exception:
                         logger.exception("worker: option chain reload after new positions failed")
 

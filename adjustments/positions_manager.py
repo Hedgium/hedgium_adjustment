@@ -189,6 +189,22 @@ class LivePositionsManager:
         with self._lock:
             return set(self._tokens)
 
+    def get_tradingsymbols(self) -> list[str]:
+        """Return deduplicated tradingsymbols from the current live positions."""
+        with self._lock:
+            symbols: list[str] = []
+            seen: set[str] = set()
+            for pos in self._positions:
+                ts = (pos.get("tradingsymbol") or "").strip()
+                if not ts:
+                    continue
+                key = ts.upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                symbols.append(ts)
+            return symbols
+
     def get_positions(self) -> list[dict]:
         """Return a snapshot of the current live positions list."""
         with self._lock:

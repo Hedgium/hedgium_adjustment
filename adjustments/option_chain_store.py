@@ -162,6 +162,56 @@ class OptionChainStore:
         always see fresh Greeks rather than a brief None window between load()
         and the next update_greeks() run.
         """
+        new = self._build_entries_from_rows(chains_data)
+
+        with self._lock:
+            # Carry over previously-computed Greeks for tokens that survive the
+            # reload.  This prevents a brief None window (and unwanted BS
+            # fallback) between this load() call and the next update_greeks().
+            old = self._chains
+            for tok, entry in new.items():
+                prev = old.get(tok)
+                if prev is None:
+                    continue
+                for field in self._COMPUTED_FIELDS:
+                    if prev.get(field) is not None:
+                        entry[field] = prev[field]
+            self._chains = new
+            if dividend_by_underlying is not None:
+                self._dividend_by_underlying = dict(dividend_by_underlying)
+
+        logger.info("OptionChainStore: loaded %s rows", len(new))
+
+    def merge_rows(self, chains_data: list[dict]) -> int:
+        """
+        Add or update rows without replacing the full store.
+
+        Returns the number of new tokens added (existing tokens are updated in
+        place but preserve computed Greeks unless the row is brand-new).
+        """
+        if not chains_data:
+            return 0
+
+        incoming = self._build_entries_from_rows(chains_data)
+        added = 0
+
+        with self._lock:
+            for tok, entry in incoming.items():
+                if tok in self._chains:
+                    prev = self._chains[tok]
+                    for field in self._COMPUTED_FIELDS:
+                        if prev.get(field) is not None:
+                            entry[field] = prev[field]
+                    self._chains[tok].update(entry)
+                else:
+                    self._chains[tok] = entry
+                    added += 1
+
+        if added:
+            logger.info("OptionChainStore: merged %s new rows (total=%s)", added, len(self._chains))
+        return added
+
+    def _build_entries_from_rows(self, chains_data: list[dict]) -> dict[int, dict]:
         new: dict[int, dict] = {}
         for row in chains_data:
             tok = row.get("zerodha_instrument_token")
@@ -186,16 +236,12 @@ class OptionChainStore:
                 "kotakneo_tradingsymbol": row.get("kotakneo_tradingsymbol") or "",
                 "exchange": row.get("exchange") or "NFO",
                 "strike_distance": row.get("strike_distance") or 0,
-                # DB-sourced fields — only used for the MANUAL path.
-                # AUTO path uses freshly-computed worker values below.
                 "greeks_calculated_by": row.get("greeks_calculated_by") or None,
                 "stored_delta": _float_or_none(row.get("greeks_delta")),
                 "stored_gamma": _float_or_none(row.get("greeks_gamma")),
                 "stored_vega": _float_or_none(row.get("greeks_vega")),
                 "stored_theta": _float_or_none(row.get("greeks_theta")),
                 "manual_delta_spot": _float_or_none(row.get("manual_delta_spot")),
-                # Freshly computed Greek fields — populated by update_greeks().
-                # Seeded from DB on load when persisted baseline exists.
                 "iv": None,
                 "delta": None,
                 "gamma": None,
@@ -205,24 +251,7 @@ class OptionChainStore:
                 "computed_at_spot": None,
             }
             _seed_computed_from_db_row(new[tok], row)
-
-        with self._lock:
-            # Carry over previously-computed Greeks for tokens that survive the
-            # reload.  This prevents a brief None window (and unwanted BS
-            # fallback) between this load() call and the next update_greeks().
-            old = self._chains
-            for tok, entry in new.items():
-                prev = old.get(tok)
-                if prev is None:
-                    continue
-                for field in self._COMPUTED_FIELDS:
-                    if prev.get(field) is not None:
-                        entry[field] = prev[field]
-            self._chains = new
-            if dividend_by_underlying is not None:
-                self._dividend_by_underlying = dict(dividend_by_underlying)
-
-        logger.info("OptionChainStore: loaded %s rows", len(new))
+        return new
 
     def get_tokens(self) -> list[int]:
         with self._lock:
