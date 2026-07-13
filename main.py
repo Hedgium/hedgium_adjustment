@@ -141,8 +141,10 @@ def _load_option_chains(
             dividend_by_underlying=resp.get("dividend_by_underlying") or {},
         )
         logger.info(
-            "worker: option chain store loaded %s rows (mode=%s)",
-            len(chains), resp.get("mode", "?"),
+            "worker: option chain store loaded %s rows (mode=%s, exchanges=%s)",
+            len(chains),
+            resp.get("mode", "?"),
+            resp.get("active_derivative_exchanges", "?"),
         )
     except Exception:
         logger.exception("worker: failed to load option chains from backend")

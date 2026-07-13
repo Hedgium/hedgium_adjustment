@@ -23,6 +23,7 @@ from datetime import date
 from typing import Optional
 
 from client import backend_api
+from market_sessions import derivative_exchanges_open, position_in_derivative_session
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,12 @@ class LivePositionsManager:
             )
 
         new_tokens: set[int] = set()
+        active_exchanges = derivative_exchanges_open()
+        session_positions: list[dict] = []
         for pos in raw_positions:
+            if not position_in_derivative_session(pos, active_exchanges):
+                continue
+            session_positions.append(pos)
             tok = pos.get("instrument_token")
             if tok is not None:
                 try:
@@ -104,7 +110,7 @@ class LivePositionsManager:
         changed = new_sig != self._last_signature
 
         with self._lock:
-            self._positions = raw_positions
+            self._positions = session_positions
             self._tokens = new_tokens
             self._last_signature = new_sig
 
