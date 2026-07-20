@@ -445,6 +445,7 @@ def compute_greeks_for_builder(
         if u:
             nd_by_u[u] += float(g.get("net_delta") or 0.0)
 
+
     net_greeks = {k: round(v, 6) for k, v in net.items()}
     net_delta_by_underlying = {k: round(v, 6) for k, v in sorted(nd_by_u.items())}
     spot_out = {u: float(spot_by_underlying.get(u) or 0.0) for u in nd_by_u}
