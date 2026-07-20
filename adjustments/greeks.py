@@ -437,15 +437,15 @@ def compute_greeks_for_builder(
     # Net Greeks
     net: dict[str, float] = defaultdict(float)
     nd_by_u: dict[str, float] = defaultdict(float)
+    greeks_by_instrument: dict[str, dict] = defaultdict(dict)
     for g in per_leg:
         for k in ("net_delta", "net_gamma", "net_theta", "net_vega"):
             net[k] += float(g.get(k) or 0.0)
-        logger.info(f"greeks: instrument={g['instrument']} net_delta={g['net_delta']} net_gamma={g['net_gamma']} net_theta={g['net_theta']} net_vega={g['net_vega']}")
+        greeks_by_instrument[g['instrument']] = {k: float(g.get(k) or 0.0) for k in ("net_delta", "net_gamma", "net_theta", "net_vega")}
         u = g.get("underlying_symbol")
         if u:
             nd_by_u[u] += float(g.get("net_delta") or 0.0)
-
-
+    logger.info(f"greeks_by_instrument at spot{spot_by_underlying}: {greeks_by_instrument}")
     net_greeks = {k: round(v, 6) for k, v in net.items()}
     net_delta_by_underlying = {k: round(v, 6) for k, v in sorted(nd_by_u.items())}
     spot_out = {u: float(spot_by_underlying.get(u) or 0.0) for u in nd_by_u}
