@@ -440,6 +440,7 @@ def compute_greeks_for_builder(
     for g in per_leg:
         for k in ("net_delta", "net_gamma", "net_theta", "net_vega"):
             net[k] += float(g.get(k) or 0.0)
+        logger.info(f"greeks: instrument={g['instrument']} net_delta={g['net_delta']} net_gamma={g['net_gamma']} net_theta={g['net_theta']} net_vega={g['net_vega']}")
         u = g.get("underlying_symbol")
         if u:
             nd_by_u[u] += float(g.get("net_delta") or 0.0)
