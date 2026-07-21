@@ -412,6 +412,7 @@ def compute_greeks_for_builder(
             return None
 
         greeks["underlying_symbol"] = under
+        greeks['quantity'] = int(quantity)
         per_leg.append(greeks)
         book_positions.append({
             "underlying_symbol": under,
@@ -441,7 +442,10 @@ def compute_greeks_for_builder(
     for g in per_leg:
         for k in ("net_delta", "net_gamma", "net_theta", "net_vega"):
             net[k] += float(g.get(k) or 0.0)
-        greeks_by_instrument[g['instrument']] = {k: float(g.get(k) or 0.0) for k in ("net_delta", "net_gamma", "net_theta", "net_vega")}
+        inst = g.get("instrument") or ""
+        row = greeks_by_instrument[inst]
+        for k in ("quantity", "net_delta", "net_gamma", "net_theta", "net_vega"):
+            row[k] = float(row.get(k) or 0.0) + float(g.get(k) or 0.0)
         u = g.get("underlying_symbol")
         if u:
             nd_by_u[u] += float(g.get("net_delta") or 0.0)

@@ -221,6 +221,10 @@ class LivePositionsManager:
         Replace each builder's ``positions`` list with live broker positions
         that match the builder's underlying symbols (derived from its legs).
 
+        Prefer positions from the builder's ``master_profile_id`` so that
+        shared-broker / multi-profile fetches do not double-count the same
+        book.  Also dedupe by (tradingsymbol, exchange, product).
+
         Falls back to the original book positions if no live positions are
         found for a builder's underlyings (so Greek computation still runs).
 
@@ -232,13 +236,22 @@ class LivePositionsManager:
         if not live_positions:
             return builders
 
-        # Group live positions by underlying_symbol
+        # Group live positions by underlying and by (profile_id, underlying)
         live_by_underlying: dict[str, list[dict]] = {}
+        live_by_profile_underlying: dict[tuple[int, str], list[dict]] = {}
         for pos in live_positions:
             u = (pos.get("underlying_symbol") or "").strip().upper()
             if not u:
                 continue
             live_by_underlying.setdefault(u, []).append(pos)
+            raw_pid = pos.get("profile_id")
+            if raw_pid is None:
+                continue
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                continue
+            live_by_profile_underlying.setdefault((pid, u), []).append(pos)
 
         result: list[dict] = []
         for builder in builders:
@@ -251,18 +264,32 @@ class LivePositionsManager:
                 if sym:
                     underlyings.add(sym)
 
-            # Gather live positions that belong to these underlyings
+            master_pid: Optional[int] = None
+            raw_master = b.get("master_profile_id")
+            if raw_master is not None:
+                try:
+                    master_pid = int(raw_master)
+                except (TypeError, ValueError):
+                    master_pid = None
+
+            # Prefer the builder's master profile; fall back to all profiles
+            # only when master_profile_id is missing.
             matched: list[dict] = []
             for u in underlyings:
-                matched.extend(live_by_underlying.get(u) or [])
+                if master_pid is not None:
+                    matched.extend(live_by_profile_underlying.get((master_pid, u)) or [])
+                else:
+                    matched.extend(live_by_underlying.get(u) or [])
+
+            matched = _dedupe_live_positions(matched)
 
             if matched:
                 # Normalize live positions into the same shape as book positions
                 b["positions"] = [_normalize_live_position(pos) for pos in matched]
                 logger.info(
                     "LivePositionsManager.map_to_builders: builder_id=%s → "
-                    "%s live positions matched (underlyings=%s)",
-                    b.get("builder_id"), len(matched), sorted(underlyings),
+                    "%s live positions matched (underlyings=%s profile_id=%s)",
+                    b.get("builder_id"), len(matched), sorted(underlyings), master_pid,
                 )
             else:
                 unenriched = sum(
@@ -271,9 +298,9 @@ class LivePositionsManager:
                 )
                 logger.warning(
                     "LivePositionsManager.map_to_builders: builder_id=%s — "
-                    "no live match for underlyings=%s "
+                    "no live match for underlyings=%s profile_id=%s "
                     "(live_total=%s unenriched=%s) → keeping DB book positions",
-                    b.get("builder_id"), sorted(underlyings),
+                    b.get("builder_id"), sorted(underlyings), master_pid,
                     len(live_positions), unenriched,
                 )
 
@@ -285,6 +312,29 @@ class LivePositionsManager:
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _dedupe_live_positions(positions: list[dict]) -> list[dict]:
+    """
+    Drop duplicate live rows for the same (tradingsymbol, exchange, product).
+
+    Shared broker accounts fetched under multiple profiles can otherwise
+    inflate quantity / net Greeks when positions are matched by underlying.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict] = []
+    for pos in positions:
+        ts = (pos.get("tradingsymbol") or "").strip().upper()
+        if not ts:
+            continue
+        ex = (pos.get("exchange") or "").strip().upper()
+        product = (pos.get("product") or "").strip().upper()
+        key = (ts, ex, product)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(pos)
+    return out
+
 
 def _normalize_live_position(pos: dict) -> dict:
     """
