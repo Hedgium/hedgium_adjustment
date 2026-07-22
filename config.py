@@ -11,22 +11,28 @@ from decouple import config as _cfg, UndefinedValueError
 
 def _env(key: str, default: str = "") -> str:
     try:
-        return (_cfg(key, default=default) or "").strip()
+        raw = (_cfg(key, default=default) or "").strip()
     except UndefinedValueError:
-        return default.strip()
+        raw = default.strip()
+    # Strip inline comments: VALUE  # comment
+    if " #" in raw:
+        raw = raw.split(" #", 1)[0].strip()
+    elif raw.startswith("#"):
+        return ""
+    return raw
 
 
 def _env_float(key: str, default: float) -> float:
     try:
-        return float(_cfg(key, default=str(default), cast=str) or str(default))
-    except (UndefinedValueError, ValueError, TypeError):
+        return float(_env(key, str(default)) or str(default))
+    except (ValueError, TypeError):
         return default
 
 
 def _env_int(key: str, default: int) -> int:
     try:
-        return int(_cfg(key, default=str(default), cast=str) or str(default))
-    except (UndefinedValueError, ValueError, TypeError):
+        return int(_env(key, str(default)) or str(default))
+    except (ValueError, TypeError):
         return default
 
 
@@ -103,6 +109,9 @@ GREEKS_STALE_THRESHOLD_S: float = _env_float("WORKER_GREEKS_STALE_THRESHOLD_S", 
 GREEKS_BOOTSTRAP_TIMEOUT_S: float = max(
     120.0, _env_float("WORKER_GREEKS_BOOTSTRAP_TIMEOUT_S", 180.0)
 )
+
+# Warn when same-strike |delta_CE| + |delta_PE| differs from 1 by more than this.
+GREEKS_DELTA_SUM_TOLERANCE: float = _env_float("WORKER_GREEKS_DELTA_SUM_TOLERANCE", 0.02)
 
 # ── Redis key schema (must match backend optionchain/mystream/constants.py) ───
 REDIS_TICKS_HASH: str = _env("MYSTREAM_TICKS_HASH", "mystream:ticks")

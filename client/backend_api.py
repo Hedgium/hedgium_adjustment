@@ -324,6 +324,8 @@ def post_adjustment_trigger(
     spot_by_underlying: dict,
     book_positions: list[dict],
     net_greeks: dict | None = None,
+    position_greeks: list[dict] | None = None,
+    master_trade_cycle_id: int | None = None,
 ) -> dict:
     """
     Send worker-computed Greek snapshot to the backend for full delta-band
@@ -342,6 +344,10 @@ def post_adjustment_trigger(
     }
     if net_greeks is not None:
         body["net_greeks"] = net_greeks
+    if position_greeks is not None:
+        body["position_greeks"] = position_greeks
+    if master_trade_cycle_id is not None:
+        body["master_trade_cycle_id"] = int(master_trade_cycle_id)
     return _request("POST", "adjustments/trigger", json=body)
 
 

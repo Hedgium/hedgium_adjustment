@@ -62,6 +62,56 @@ def fetch_ltps_from_kite(
         return {}
 
 
+def fetch_quotes_from_kite(
+    api_key: str,
+    access_token: str,
+    tokens: list[int],
+) -> dict[int, dict]:
+    """
+    Fetch full quotes (LTP + best bid/ask) via Kite REST ``/quote``.
+
+    Returns ``{instrument_token: {last_price, bid_price, ask_price}}``.
+    """
+    if not tokens:
+        return {}
+    try:
+        import requests as _requests
+        from urllib.parse import quote as _quote
+
+        headers = {
+            "X-Kite-Version": "3",
+            "Authorization": f"token {api_key}:{access_token}",
+        }
+        tokens_str = "&i=".join(_quote(str(t), safe="") for t in tokens)
+        url = f"https://api.kite.trade/quote?i={tokens_str}"
+        resp = _requests.get(url, headers=headers, timeout=15)
+        data = resp.json()
+        out: dict[int, dict] = {}
+        for _key, val in (data.get("data") or {}).items():
+            inst_tok = val.get("instrument_token")
+            if inst_tok is None:
+                continue
+            depth = val.get("depth") or {}
+            buy = (depth.get("buy") or [{}])
+            sell = (depth.get("sell") or [{}])
+            bid = 0.0
+            ask = 0.0
+            if buy and isinstance(buy[0], dict):
+                bid = float(buy[0].get("price") or 0)
+            if sell and isinstance(sell[0], dict):
+                ask = float(sell[0].get("price") or 0)
+            # Some payloads also expose top-of-book on ohlc/last_price only.
+            out[int(inst_tok)] = {
+                "last_price": float(val.get("last_price") or 0),
+                "bid_price": bid,
+                "ask_price": ask,
+            }
+        return out
+    except Exception as exc:
+        logger.warning("token_fetcher: quote fetch failed: %s", exc)
+        return {}
+
+
 def _fetch_initial_ltps(
     api_key: str,
     access_token: str,

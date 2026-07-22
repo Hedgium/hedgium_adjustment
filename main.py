@@ -64,6 +64,7 @@ from stream.ws_stream import KiteQuoteStreamer, run_multi_connection_stream
 from adjustments.runner import AdjustmentRunner
 from adjustments.option_chain_store import OptionChainStore
 from adjustments.positions_manager import LivePositionsManager
+from adjustments.futures_underlier import refresh_nfo_futures
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,14 +184,62 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         credentials = _wait_for_credentials()
         logger.info("worker: credentials OK (api_key=%s…)", credentials["api_key"][:6])
 
-        # 2. Token set
-        token_set, all_tokens = _wait_for_tokens(credentials)
+        # 2. Token set (backend option + equity tokens)
+        token_set, base_tokens = _wait_for_tokens(credentials)
 
         option_tokens = sorted(set(token_set.option_tokens))
         underlying_symbols = sorted(token_set.underlying_token_by_symbol.keys())
 
         # 3. Load option chains into memory store
         _load_option_chains(option_chain_store, underlying_symbols)
+
+        # 3b. Resolve NFO futures for Greeks underliers and merge into WS set
+        try:
+            refresh_nfo_futures(credentials["api_key"], credentials["access_token"], force=True)
+            fut_tokens = option_chain_store.future_tokens_for_subscription(credentials)
+        except Exception:
+            logger.exception("worker: futures underlier resolution failed")
+            fut_tokens = []
+
+        all_tokens = sorted(set(base_tokens) | set(fut_tokens))
+        if fut_tokens:
+            logger.info(
+                "worker: added %s futures tokens for Greeks underliers (total tokens=%s)",
+                len(fut_tokens), len(all_tokens),
+            )
+            # Seed futures LTP hash (full quotes arrive via WS)
+            try:
+                from stream.token_fetcher import fetch_ltps_from_kite, fetch_quotes_from_kite
+                from stream.redis_writer import write_ticks_batch
+
+                quotes = fetch_quotes_from_kite(
+                    credentials["api_key"], credentials["access_token"], fut_tokens,
+                )
+                if quotes:
+                    seed_ticks = []
+                    ltp_map: dict[int, float] = {}
+                    for tok, q in quotes.items():
+                        seed_ticks.append({
+                            "instrument_token": tok,
+                            "last_price": float(q.get("last_price") or 0),
+                            "bid_price": float(q.get("bid_price") or 0),
+                            "ask_price": float(q.get("ask_price") or 0),
+                        })
+                        lp = float(q.get("last_price") or 0)
+                        if lp > 0:
+                            ltp_map[tok] = lp
+                    if seed_ticks:
+                        write_ticks_batch(r, seed_ticks)
+                    if ltp_map:
+                        write_ltps(r, ltp_map)
+                else:
+                    ltp_map = fetch_ltps_from_kite(
+                        credentials["api_key"], credentials["access_token"], fut_tokens,
+                    )
+                    if ltp_map:
+                        write_ltps(r, ltp_map)
+            except Exception:
+                logger.exception("worker: futures quote seed failed")
 
         # 4. Tick queue + persist-active guard
         tick_q: queue.Queue = queue.Queue()
@@ -200,6 +249,35 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         # Current subscribed token set (mutable list shared with positions thread)
         current_tokens: list[int] = list(all_tokens)
         current_tokens_lock = threading.Lock()
+
+        def _ensure_futures_subscribed() -> None:
+            """Subscribe any newly resolved FUT underliers after chain reloads."""
+            try:
+                ftoks = option_chain_store.future_tokens_for_subscription(credentials)
+            except Exception:
+                logger.debug("worker: futures subscription resolve failed", exc_info=True)
+                return
+            if not ftoks:
+                return
+            with current_tokens_lock:
+                old_set = set(current_tokens)
+            add_tokens = sorted(set(ftoks) - old_set)
+            if not add_tokens:
+                return
+            logger.info("worker: subscribing %s new futures underlier tokens", len(add_tokens))
+            add_queue = list(add_tokens)
+            total_per_stream = cfg.MAX_INSTRUMENTS_PER_WS
+            for s in streams:
+                if not add_queue:
+                    break
+                spare = total_per_stream - len(s.tokens)
+                if spare <= 0:
+                    continue
+                batch = add_queue[:spare]
+                add_queue = add_queue[spare:]
+                s.update_subscriptions(add_tokens=batch, remove_tokens=[])
+            with current_tokens_lock:
+                current_tokens.extend(add_tokens)
 
         def _persist_active() -> bool:
             return cfg.GREEKS_PERSIST_ENABLED
@@ -220,6 +298,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                         option_chain_store,
                         include_tradingsymbols=positions_manager.get_tradingsymbols() or None,
                     )
+                    _ensure_futures_subscribed()
                 except Exception:
                     logger.exception("worker: option chain reload error")
 
@@ -324,6 +403,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                             option_chain_store,
                             include_tradingsymbols=positions_manager.get_tradingsymbols() or None,
                         )
+                        _ensure_futures_subscribed()
                     except Exception:
                         logger.exception("worker: option chain reload after new positions failed")
 
@@ -475,6 +555,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 positions_manager=positions_manager,
                 option_chain_store=option_chain_store,
                 greeks_ready=_first_greeks_ready,
+                credentials=credentials,
             )
             adj_runner.start()
 
@@ -492,7 +573,9 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
 
         # 9. Session watch loop
         should_restart = False
-        last_reload_t = 0.0
+        # Start the clock now so the first reload check waits a full interval
+        # (monotonic()-0 would always fire immediately after each restart).
+        last_reload_t = time.monotonic()
         try:
             while not _stop_requested.is_set():
                 time.sleep(2)
@@ -515,7 +598,16 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                     last_reload_t = now_m
                     try:
                         latest = collect_stream_tokens(credentials)
-                        latest_tokens = sorted(set(latest.option_tokens + latest.equity_tokens))
+                        latest_base = sorted(set(latest.option_tokens + latest.equity_tokens))
+                        # Merge futures the same way as startup so we don't
+                        # false-trigger on 108 (with FUT) vs 106 (backend only).
+                        try:
+                            latest_futs = option_chain_store.future_tokens_for_subscription(
+                                credentials
+                            )
+                        except Exception:
+                            latest_futs = list(fut_tokens)
+                        latest_tokens = sorted(set(latest_base) | set(latest_futs or []))
                         if latest_tokens != all_tokens:
                             logger.info(
                                 "worker: token set changed (%s→%s) — reloading",

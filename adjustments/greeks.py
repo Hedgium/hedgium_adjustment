@@ -1,12 +1,11 @@
 """
 Standalone Greek computation for the worker.
 
-Mirrors the three-path logic of ``optionchain.greeks_service.get_greeks_for_position``:
+Uses NFO futures underlier ``F`` matched to option expiry (no dividend), with
+Black-Scholes at ``r=0``:
 
-  1. MANUAL source  — stored delta adjusted for spot move via stored gamma.
-                      Never uses Black-Scholes.  Never writes to DB.
-  2. AUTO baseline  — stored AUTO delta adjusted for current spot via stored gamma.
-  3. BS fallback    — fresh implied-vol → Black-Scholes when no usable stored baseline.
+  1. Gamma-adjusted — stored delta adjusted for futures move via stored gamma.
+  2. BS fallback — fresh implied-vol → Black-Scholes when no usable stored baseline.
 
 Stored Greek data comes from the ``OptionChainStore`` which is loaded from
 ``GET /internal/option-chains/`` at startup and refreshed on every session reload.
@@ -17,15 +16,19 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone, datetime
 from typing import Optional
 
 import config as cfg
-from adjustments.dividend import effective_spot_for_greeks
+from adjustments.futures_underlier import (
+    FUTURES_RISK_FREE_RATE,
+    get_future_price_for_option,
+)
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
 
 logger = logging.getLogger(__name__)
 
+# Legacy cash-spot BS rate (unused on futures underlier path).
 DEFAULT_RISK_FREE_RATE = 0.065
 
 
@@ -139,6 +142,8 @@ def get_greeks_for_position(
     """
     Compute net Greeks for one position for the adjustment check.
 
+    ``underlying_spot`` is the futures underlier ``F`` (no dividend adjustment).
+
     Path 1 — Gamma-adjusted (in-memory baseline is fresh)
         Uses the delta/gamma/spot stored by the last ``update_greeks()`` run.
         Applies:  delta = (S - computed_at_spot) × gamma + stored_delta
@@ -147,7 +152,7 @@ def get_greeks_for_position(
     Path 2 — Black-Scholes fallback
         Used when the in-memory baseline is absent or older than
         ``GREEKS_STALE_THRESHOLD_S`` seconds (default 5 min).
-        Runs fresh IV → BS from live Redis tick.
+        Runs fresh IV → BS from live Redis tick with ``r=0``.
 
     ``stored_chain`` is a row from ``OptionChainStore.get_chain_by_token()``.
     Returns a dict or None if data is insufficient.
@@ -159,8 +164,11 @@ def get_greeks_for_position(
     if quantity == 0:
         return None
 
-    S_raw = float(underlying_spot)
-    S = effective_spot_for_greeks(S_raw, expiry, dividend)
+    # Futures underlier — ignore dividend (carry already in F).
+    _ = dividend
+    S = float(underlying_spot)
+    if S <= 0:
+        return None
 
     # Always fetch tick — needed for bid/ask/ltp output and BS fallback.
     tick = fetch_tick_by_token(r, tok)
@@ -193,12 +201,6 @@ def get_greeks_for_position(
         iv_val   = 0.0
         path     = "gamma_adj"
 
-        # logger.info(
-        #     "greeks[GAMMA-ADJ]: token=%s spot=%.2f ref_spot=%.2f Δspot=%.2f "
-        #     "gamma=%.6f stored_delta=%.6f → delta=%.6f",
-        #     tok, S, ref_spot, S - ref_spot, gamma_pu, float(_w_delta), delta_pu,
-        # )
-
     # ── Path 2: Black-Scholes fallback (stale or missing baseline) ───────────
     else:
         age_info = ""
@@ -220,7 +222,7 @@ def get_greeks_for_position(
 
         flag  = "c" if str(option_type).upper() == "CE" else "p"
         t     = _tte_years(expiry)
-        r_rate = DEFAULT_RISK_FREE_RATE
+        r_rate = FUTURES_RISK_FREE_RATE
 
         iv = _implied_vol(flag, mid, S, float(strike), t, r_rate)
         if iv is None or iv <= 0:
@@ -245,13 +247,6 @@ def get_greeks_for_position(
     q    = quantity
     sign = 1 if q > 0 else -1 if q < 0 else 0
     aq   = abs(q)
-
-    # logger.info(
-    #     "greeks[pos]: %s tok=%s qty=%s bid=%.4f ask=%.4f ltp=%.4f mid=%.4f "
-    #     "delta=%.6f net_delta=%.6f path=%s",
-    #     instrument_label, tok, q, bid, ask, ltp, mid,
-    #     delta_pu, round(delta_pu * aq * sign, 6), path,
-    # )
 
     return {
         "instrument":              instrument_label,
@@ -313,6 +308,7 @@ def compute_greeks_for_builder(
     r,
     builder_data: dict,
     option_chain_store=None,
+    credentials: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Compute Greek snapshot for a single builder using data from the backend API.
@@ -320,31 +316,28 @@ def compute_greeks_for_builder(
     ``builder_data`` is one item from ``/internal/adjustments/builders``
     ``builders`` list.
 
+    Underlier is the NFO futures price matched to each position's expiry
+    (no dividend).  ``credentials`` enables Kite quote fallback when Redis
+    has no futures tick yet.
+
     ``option_chain_store`` is an optional ``OptionChainStore`` instance.  When
     provided, stored Greek data (MANUAL / AUTO-baseline) is looked up per token
-    and passed to ``get_greeks_for_position``, enabling the same three-path
-    calculation as the Django backend's ``greeks_service``.
+    and passed to ``get_greeks_for_position``.
 
     Returns a snapshot dict or None if skipped.
     """
     positions = builder_data.get("positions") or []
-    legs = builder_data.get("legs") or []
     builder_id = builder_data["builder_id"]
     strategy_id = builder_data["strategy_id"]
+    master_profile_id = builder_data.get("master_profile_id")
+    master_trade_cycle_id = builder_data.get("master_trade_cycle_id")
 
     if not positions:
         return None
 
-    dividend_by_underlying: dict = builder_data.get("dividend_by_underlying") or {}
-
-    # Build underlying→token map from legs
-    leg_token_by_symbol: dict[str, int] = {}
-    for leg in legs:
-        tok = leg.get("token")
-        sym = (leg.get("symbol") or "").strip().upper()
-        if tok and sym:
-            leg_token_by_symbol[sym] = int(tok)
-
+    # Futures F keyed by (underlying, expiry)
+    fut_by_key: dict[tuple[str, date], float] = {}
+    # For API payload: one representative F per underlying (first seen)
     spot_by_underlying: dict[str, float] = {}
     per_leg: list[dict] = []
     book_positions: list[dict] = []
@@ -372,16 +365,20 @@ def compute_greeks_for_builder(
             )
             continue
 
-        if under not in spot_by_underlying:
-            utok = leg_token_by_symbol.get(under)
-            spot = get_underlying_spot(r, under, utok)
-            spot_by_underlying[under] = spot
+        fkey = (under, expiry)
+        if fkey not in fut_by_key:
+            price, _fut, _src = get_future_price_for_option(
+                r, credentials, under, expiry,
+            )
+            fut_by_key[fkey] = float(price) if price and price > 0 else 0.0
+            if fut_by_key[fkey] > 0 and under not in spot_by_underlying:
+                spot_by_underlying[under] = fut_by_key[fkey]
 
-        spot = spot_by_underlying.get(under, 0.0)
+        spot = fut_by_key.get(fkey, 0.0)
         if spot <= 0:
             logger.debug(
-                "greeks: builder_id=%s no spot for underlying=%s — skipping position",
-                builder_id, under,
+                "greeks: builder_id=%s no futures price for underlying=%s expiry=%s — skipping",
+                builder_id, under, expiry_str,
             )
             continue
 
@@ -400,7 +397,7 @@ def compute_greeks_for_builder(
             quantity=int(quantity),
             instrument_label=instrument,
             stored_chain=stored_chain,
-            dividend=dividend_by_underlying.get(under),
+            dividend=None,
         )
 
         if greeks is None:
@@ -412,7 +409,12 @@ def compute_greeks_for_builder(
             return None
 
         greeks["underlying_symbol"] = under
-        greeks['quantity'] = int(quantity)
+        greeks["quantity"] = int(quantity)
+        greeks["position_id"] = pos.get("position_id")
+        greeks["instrument"] = instrument or pos.get("instrument") or ""
+        greeks["exchange"] = exchange
+        greeks["spot"] = spot
+        greeks["calculated_at"] = datetime.now(timezone.utc).isoformat()
         per_leg.append(greeks)
         book_positions.append({
             "underlying_symbol": under,
@@ -438,27 +440,26 @@ def compute_greeks_for_builder(
     # Net Greeks
     net: dict[str, float] = defaultdict(float)
     nd_by_u: dict[str, float] = defaultdict(float)
-    greeks_by_instrument: dict[str, dict] = defaultdict(dict)
+    greeks_by_legs: dict[str, dict] = {}
     for g in per_leg:
         for k in ("net_delta", "net_gamma", "net_theta", "net_vega"):
             net[k] += float(g.get(k) or 0.0)
-        inst = g.get("instrument") or ""
-        row = greeks_by_instrument[inst]
-        for k in ("quantity", "net_delta", "net_gamma", "net_theta", "net_vega"):
-            row[k] = float(row.get(k) or 0.0) + float(g.get(k) or 0.0)
+        greeks_by_legs[g.get("instrument")] = {k: round(float(g.get(k) or 0.0), 6) for k in ("net_delta", "net_gamma", "net_theta", "net_vega")}
+
         u = g.get("underlying_symbol")
         if u:
             nd_by_u[u] += float(g.get("net_delta") or 0.0)
-    logger.info(f"greeks_by_instrument at spot{spot_by_underlying}: {greeks_by_instrument}")
+
     net_greeks = {k: round(v, 6) for k, v in net.items()}
     net_delta_by_underlying = {k: round(v, 6) for k, v in sorted(nd_by_u.items())}
     spot_out = {u: float(spot_by_underlying.get(u) or 0.0) for u in nd_by_u}
 
+    # logger.info(f"greeks_by_legs: {greeks_by_legs}")
     underlyings = sorted(nd_by_u.keys())
 
     logger.info(
         "[net-delta] builder_id=%s strategy_id=%s legs=%s "
-        "net_delta_by_underlying=%s net_gamma=%.6f spot=%s",
+        "net_delta_by_underlying=%s net_gamma=%.6f futures=%s",
         builder_id,
         strategy_id,
         len(per_leg),
@@ -467,10 +468,11 @@ def compute_greeks_for_builder(
         {u: round(v, 2) for u, v in spot_out.items()},
     )
 
-
     return {
         "builder_id": builder_id,
         "strategy_id": strategy_id,
+        "master_profile_id": master_profile_id,
+        "master_trade_cycle_id": master_trade_cycle_id,
         "underlyings": underlyings,
         "net_greeks": net_greeks,
         "net_delta_by_underlying": net_delta_by_underlying,

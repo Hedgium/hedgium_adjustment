@@ -48,11 +48,13 @@ class AdjustmentRunner:
         positions_manager=None,
         option_chain_store=None,
         greeks_ready: threading.Event | None = None,
+        credentials: Optional[dict] = None,
     ):
         self._r = redis_client
         self._positions_manager = positions_manager
         self._option_chain_store = option_chain_store
         self._greeks_ready = greeks_ready
+        self._credentials = credentials
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # strategy_id -> canonical position signature from previous cycle
@@ -165,6 +167,7 @@ class AdjustmentRunner:
                     self._r,
                     builder_data,
                     option_chain_store=self._option_chain_store,
+                    credentials=self._credentials,
                 )
             except Exception:
                 logger.exception(
@@ -220,6 +223,8 @@ class AdjustmentRunner:
                     spot_by_underlying=snap["spot_by_underlying"],
                     book_positions=snap["book_positions"],
                     net_greeks=snap.get("net_greeks"),
+                    position_greeks=snap.get("per_leg"),
+                    master_trade_cycle_id=builder_data.get("master_trade_cycle_id"),
                 )
                 status = result.get("status", "unknown")
                 if status == "pushed":

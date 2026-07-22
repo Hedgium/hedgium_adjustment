@@ -19,14 +19,21 @@ from datetime import date, datetime
 from typing import Optional
 
 import config as cfg
-from adjustments.dividend import effective_spot_for_greeks
-from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
+from adjustments.futures_underlier import (
+    FUTURES_RISK_FREE_RATE,
+    future_tokens_for_pairs,
+    get_future_price,
+    get_future_price_for_option,
+    refresh_nfo_futures,
+)
+from stream.redis_writer import fetch_tick_by_token
 
 logger = logging.getLogger(__name__)
 
+# Kept for MANUAL / legacy call sites that still import the name; AUTO uses futures r=0.
 DEFAULT_RISK_FREE_RATE = 0.065
 
-# Maximum tokens to batch in a single Kite REST LTP fallback call.
+# Maximum tokens to batch in a single Kite REST fallback call.
 _KITE_BATCH_SIZE = 500
 
 
@@ -271,6 +278,22 @@ class OptionChainStore:
         with self._lock:
             return len(self._chains)
 
+    def underlying_expiry_pairs(self) -> list[tuple[str, date]]:
+        """Unique ``(underlying_symbol, expiry)`` pairs present in the store."""
+        with self._lock:
+            rows = list(self._chains.values())
+        pairs: set[tuple[str, date]] = set()
+        for row in rows:
+            u = (row.get("underlying_symbol") or "").upper()
+            exp = row.get("expiry")
+            if u and isinstance(exp, date):
+                pairs.add((u, exp))
+        return sorted(pairs)
+
+    def future_tokens_for_subscription(self, credentials: dict | None = None) -> list[int]:
+        """Resolve NFO FUT tokens needed for Greeks underliers."""
+        return future_tokens_for_pairs(self.underlying_expiry_pairs(), credentials)
+
     def has_fresh_greeks(self) -> bool:
         """True if at least one row has a non-stale gamma-adjustment baseline."""
         with self._lock:
@@ -291,40 +314,42 @@ class OptionChainStore:
 
     def update_greeks(self, r, credentials: dict) -> int:
         """
-        Recompute IV + BS Greeks for every chain row using live Redis ticks.
+        Recompute IV + BS Greeks for every chain row using futures underlier ``F``.
 
-        When a tick is absent from Redis, falls back to Kite REST LTP for the
-        option itself (using ``fetch_ltps_from_kite``).
-
-        ``credentials`` must have ``api_key`` and ``access_token``.
+        Underlier: NFO future matched to option expiry; price = liquid LTP else
+        bid/ask mid (no dividend).  BS uses ``r=0``.  When both CE and PE mids
+        exist for a strike, a shared IV is used so ``|Δ_CE|+|Δ_PE|≈1``.
 
         Returns the number of tokens successfully updated.
         """
         with self._lock:
             chains_snapshot = dict(self._chains)
-            dividend_map = dict(self._dividend_by_underlying)
 
         if not chains_snapshot:
             return 0
 
-        # 1. Gather all spot prices (underlying LTPs) from Redis
-        spot_cache: dict[str, float] = {}
-        ltps_redis = fetch_ltps(r)
-        for token, row in chains_snapshot.items():
-            u = row["underlying_symbol"]
-            if u in spot_cache:
-                continue
-            utok = resolve_underlying_zerodha_token(r, u)
-            spot = 0.0
-            if utok:
-                tick = fetch_tick_by_token(r, utok)
-                if tick:
-                    spot = float(tick.get("last_price") or 0)
-                if spot <= 0:
-                    spot = float(ltps_redis.get(utok) or 0)
-            spot_cache[u] = spot
+        api_key = credentials.get("api_key", "")
+        access_token = credentials.get("access_token", "")
+        refresh_nfo_futures(api_key, access_token)
 
-        # 2. Find tokens with no Redis tick (need Kite REST fallback)
+        # 1. Futures price cache keyed by (underlying, expiry)
+        fut_price_cache: dict[tuple[str, date], float] = {}
+        fut_meta_cache: dict[tuple[str, date], dict] = {}
+        for row in chains_snapshot.values():
+            u = (row.get("underlying_symbol") or "").upper()
+            exp = row.get("expiry")
+            if not u or not isinstance(exp, date):
+                continue
+            key = (u, exp)
+            if key in fut_price_cache:
+                continue
+            price, fut, _src = get_future_price_for_option(r, credentials, u, exp)
+            if price is not None and price > 0:
+                fut_price_cache[key] = float(price)
+            if fut:
+                fut_meta_cache[key] = fut
+
+        # 2. Option ticks from Redis; Kite quote fallback for missing
         missing_tokens: list[int] = []
         tick_cache: dict[int, dict] = {}
         for token in chains_snapshot:
@@ -334,56 +359,82 @@ class OptionChainStore:
             else:
                 missing_tokens.append(token)
 
-        # 3. Batch-fetch missing ticks from Kite REST
         if missing_tokens:
-            from stream.token_fetcher import fetch_ltps_from_kite
+            from stream.token_fetcher import fetch_ltps_from_kite, fetch_quotes_from_kite
 
-            api_key = credentials.get("api_key", "")
-            access_token = credentials.get("access_token", "")
-            kite_ltps: dict[int, float] = {}
             for i in range(0, len(missing_tokens), _KITE_BATCH_SIZE):
                 batch = missing_tokens[i: i + _KITE_BATCH_SIZE]
-                kite_ltps.update(fetch_ltps_from_kite(api_key, access_token, batch))
-            for tok, ltp in kite_ltps.items():
-                if ltp > 0:
-                    tick_cache[tok] = {"last_price": ltp, "bid_price": ltp, "ask_price": ltp}
+                quotes = fetch_quotes_from_kite(api_key, access_token, batch)
+                if quotes:
+                    for tok, q in quotes.items():
+                        tick_cache[tok] = q
+                    continue
+                # OHLC LTP-only fallback if full quote unavailable
+                kite_ltps = fetch_ltps_from_kite(api_key, access_token, batch)
+                for tok, ltp in kite_ltps.items():
+                    if ltp > 0:
+                        tick_cache[tok] = {
+                            "last_price": ltp,
+                            "bid_price": ltp,
+                            "ask_price": ltp,
+                        }
 
-        # 4. Compute Greeks
+        # Also ensure futures quotes are warm in Redis path (batch missing FUT tokens)
+        fut_tokens_needed = [
+            int(m["instrument_token"])
+            for m in fut_meta_cache.values()
+            if m.get("instrument_token")
+        ]
+        missing_futs = [
+            t for t in fut_tokens_needed
+            if get_future_price(r, None, t)[0] is None
+        ]
+        if missing_futs:
+            from stream.token_fetcher import fetch_quotes_from_kite
+
+            for i in range(0, len(missing_futs), _KITE_BATCH_SIZE):
+                batch = missing_futs[i: i + _KITE_BATCH_SIZE]
+                fetch_quotes_from_kite(api_key, access_token, batch)
+            # Re-resolve prices after quote fetch (get_future_price will use kite)
+            for key, meta in list(fut_meta_cache.items()):
+                if key in fut_price_cache:
+                    continue
+                price, _src = get_future_price(r, credentials, int(meta["instrument_token"]))
+                if price is not None and price > 0:
+                    fut_price_cache[key] = float(price)
+
         now_iso = datetime.utcnow().isoformat()
-        updated = 0
         updates: dict[int, dict] = {}
+        r_rate = FUTURES_RISK_FREE_RATE
+
+        # 3a. MANUAL path (futures F, no dividend)
+        auto_candidates: list[tuple[int, dict, float, float, str]] = []
+        # token, row, F, mid, flag
 
         for token, row in chains_snapshot.items():
             expiry = row.get("expiry")
             strike = row.get("strike")
             option_type = row.get("option_type", "")
-            underlying = row.get("underlying_symbol", "")
+            underlying = (row.get("underlying_symbol") or "").upper()
 
             if not expiry or strike is None or not option_type or not underlying:
                 continue
 
-            spot_raw = spot_cache.get(underlying, 0.0)
-            if spot_raw <= 0:
+            F = fut_price_cache.get((underlying, expiry), 0.0)
+            if F <= 0:
                 continue
 
-            div_cfg = dividend_map.get(underlying)
-            spot = effective_spot_for_greeks(spot_raw, expiry, div_cfg)
-
             calc_by = (row.get("greeks_calculated_by") or "").upper()
-
-            # ── MANUAL path ──────────────────────────────────────────────────
-            # Use gamma-adjusted delta from the DB-stored manual values.
-            # No Black-Scholes is run; bid/ask not required.
             if calc_by == "MANUAL":
                 stored_delta = row.get("stored_delta")
                 if stored_delta is None:
                     continue
                 stored_gamma = float(row.get("stored_gamma") or 0.0)
-                stored_vega  = float(row.get("stored_vega")  or 0.0)
+                stored_vega = float(row.get("stored_vega") or 0.0)
                 stored_theta = float(row.get("stored_theta") or 0.0)
-                manual_spot  = row.get("manual_delta_spot")
+                manual_spot = row.get("manual_delta_spot")
                 if manual_spot is not None:
-                    eff_delta = (spot - float(manual_spot)) * stored_gamma + float(stored_delta)
+                    eff_delta = (F - float(manual_spot)) * stored_gamma + float(stored_delta)
                 else:
                     eff_delta = float(stored_delta)
                 updates[token] = {
@@ -391,62 +442,103 @@ class OptionChainStore:
                     "delta": round(eff_delta, 6),
                     "gamma": round(stored_gamma, 8),
                     "theta": round(stored_theta, 6),
-                    "vega":  round(stored_vega,  6),
+                    "vega": round(stored_vega, 6),
                     "last_greeks_at": now_iso,
-                    "computed_at_spot": spot_raw,
+                    "computed_at_spot": F,
                 }
-                updated += 1
                 continue
 
-            # ── AUTO path (Black-Scholes) ─────────────────────────────────────
             tick = tick_cache.get(token)
             if not tick:
                 continue
-
             bid = float(tick.get("bid_price") or tick.get("last_price") or 0)
             ask = float(tick.get("ask_price") or tick.get("last_price") or 0)
             ltp = float(tick.get("last_price") or 0)
             mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask, ltp)
-
             if mid <= 0:
                 continue
-
             flag = "c" if option_type.upper() == "CE" else "p"
-            t = _tte_years(expiry)
+            auto_candidates.append((token, row, F, mid, flag))
 
-            iv = _implied_vol(flag, mid, spot, float(strike), t, DEFAULT_RISK_FREE_RATE)
-            if not iv:
+        # 3b. AUTO path with shared IV per (underlying, expiry, strike)
+        groups: dict[tuple, list[tuple[int, dict, float, float, str]]] = defaultdict(list)
+        for item in auto_candidates:
+            token, row, F, mid, flag = item
+            key = (
+                row["underlying_symbol"],
+                row["expiry"],
+                float(row["strike"]),
+            )
+            groups[key].append(item)
+
+        for _gkey, items in groups.items():
+            t = _tte_years(items[0][1]["expiry"])
+            F = items[0][2]
+            strike = float(items[0][1]["strike"])
+
+            ivs: list[float] = []
+            for token, row, _F, mid, flag in items:
+                iv = _implied_vol(flag, mid, F, strike, t, r_rate)
+                if iv:
+                    ivs.append(iv)
+
+            if not ivs:
                 continue
+            shared_iv = sum(ivs) / len(ivs)
 
-            g = _bs_greeks(flag, spot, float(strike), t, DEFAULT_RISK_FREE_RATE, iv)
-            if not g:
-                continue
+            ce_d = None
+            pe_d = None
+            for token, row, _F, mid, flag in items:
+                g = _bs_greeks(flag, F, strike, t, r_rate, shared_iv)
+                if not g:
+                    continue
+                updates[token] = {
+                    "iv": round(g["iv"], 6),
+                    "delta": round(g["delta"], 6),
+                    "gamma": round(g["gamma"], 8),
+                    "theta": round(g["theta"], 6),
+                    "vega": round(g["vega"], 6),
+                    "last_greeks_at": now_iso,
+                    "computed_at_spot": F,
+                }
+                ot = (row.get("option_type") or "").upper()
+                if ot == "CE":
+                    ce_d = float(g["delta"])
+                elif ot == "PE":
+                    pe_d = float(g["delta"])
 
-            updates[token] = {
-                "iv": round(g["iv"], 6),
-                "delta": round(g["delta"], 6),
-                "gamma": round(g["gamma"], 8),
-                "theta": round(g["theta"], 6),
-                "vega":  round(g["vega"],  6),
-                "last_greeks_at": now_iso,
-                "computed_at_spot": spot_raw,
-            }
-            updated += 1
+            if ce_d is not None and pe_d is not None:
+                abs_sum = abs(ce_d) + abs(pe_d)
+                if abs(abs_sum - 1.0) > cfg.GREEKS_DELTA_SUM_TOLERANCE:
+                    logger.warning(
+                        "OptionChainStore: delta-sum check failed "
+                        "underlying=%s expiry=%s strike=%s "
+                        "|dCE|+|dPE|=%.6f (tol=%.4f) shared_iv=%.4f F=%.2f",
+                        items[0][1]["underlying_symbol"],
+                        items[0][1]["expiry"],
+                        strike,
+                        abs_sum,
+                        cfg.GREEKS_DELTA_SUM_TOLERANCE,
+                        shared_iv,
+                        F,
+                    )
 
-        # 5. Write updates back to store
+        # 4. Write updates
         with self._lock:
             for token, greeks in updates.items():
                 if token in self._chains:
                     self._chains[token].update(greeks)
 
+        updated = len(updates)
         if updated:
             logger.info(
-                "OptionChainStore: updated Greeks for %s/%s tokens",
+                "OptionChainStore: updated Greeks for %s/%s tokens (futures underlier)",
                 updated, len(chains_snapshot),
             )
         else:
             logger.debug(
-                "OptionChainStore: no Greeks updated (total=%s)", len(chains_snapshot)
+                "OptionChainStore: no Greeks updated (total=%s fut_prices=%s)",
+                len(chains_snapshot), len(fut_price_cache),
             )
 
         return updated
