@@ -34,11 +34,12 @@ Greeks use the **NFO futures price** `F` for `(underlying, option_expiry)`, not 
 | Rule | Detail |
 |------|--------|
 | Contract | Exact FUT expiry match → else nearest FUT with `expiry >= option expiry` → else nearest overall |
-| Quote | Liquid LTP if `bid ≤ ltp ≤ ask`; else bid/ask mid; else LTP fallback |
+| Quote | Liquid LTP if `bid ≤ ltp ≤ ask`; else bid/ask mid; else LTP; else **cash/index spot** |
 | Dividend | Not applied (carry is already in `F`) |
 | Rate | Black–Scholes with `S = F`, `r = 0` |
 | Shared IV | Same strike CE+PE share one IV (mean of both) so `\|Δ_CE\| + \|Δ_PE\| ≈ 1` |
-| Baseline | `computed_at_spot` stores `F` for gamma-adjusted path |
+| Baseline | AUTO: `computed_at_spot` = futures `F`. MANUAL: gamma-adj vs cash spot / `manual_delta_spot` |
+| Strategy spot | `greek_spot_by_underlying` stores **cash/index LTP**, not futures |
 
 Key modules:
 

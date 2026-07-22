@@ -32,6 +32,7 @@ def future_price_from_quote(
     bid: float,
     ask: float,
     ltp: float,
+    spot: float = 0.0,
 ) -> tuple[Optional[float], str]:
     """
     Pick futures underlier price from a quote.
@@ -40,22 +41,54 @@ def future_price_from_quote(
       - ``ltp``          — liquid (LTP inside live bid/ask)
       - ``mid``          — bid/ask mid when LTP not liquid
       - ``ltp_fallback`` — LTP only (no usable book)
+      - ``spot``         — cash/index spot as last resort
       - ``none``         — no usable price
     """
     try:
         bid_f = float(bid or 0)
         ask_f = float(ask or 0)
         ltp_f = float(ltp or 0)
+        spot_f = float(spot or 0)
     except (TypeError, ValueError):
         return None, "none"
 
+    # Liquid future: last trade inside the live book
     if ltp_f > 0 and bid_f > 0 and ask_f > 0 and bid_f <= ltp_f <= ask_f:
         return ltp_f, "ltp"
     if bid_f > 0 and ask_f > 0:
         return (bid_f + ask_f) / 2.0, "mid"
     if ltp_f > 0:
         return ltp_f, "ltp_fallback"
+    if spot_f > 0:
+        return spot_f, "spot"
     return None, "none"
+
+
+def _cash_spot_from_redis(r, underlying: str) -> float:
+    """Cash/index LTP for ``underlying`` from Redis (tick, then LTP hash)."""
+    if r is None:
+        return 0.0
+    from stream.redis_writer import resolve_underlying_zerodha_token
+
+    u = (underlying or "").strip().upper()
+    if not u:
+        return 0.0
+    utok = resolve_underlying_zerodha_token(r, u)
+    if not utok:
+        return 0.0
+    tick = fetch_tick_by_token(r, utok)
+    if tick:
+        try:
+            lp = float(tick.get("last_price") or 0)
+            if lp > 0:
+                return lp
+        except (TypeError, ValueError):
+            pass
+    ltps = fetch_ltps(r)
+    try:
+        return float(ltps.get(utok) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _parse_expiry(raw) -> Optional[date]:
@@ -166,11 +199,13 @@ def get_future_price(
     r,
     credentials: Optional[dict],
     fut_token: int,
+    spot: float = 0.0,
 ) -> tuple[Optional[float], str]:
     """
     Resolve futures price for ``fut_token``.
 
     Redis tick first; else Kite full quote when credentials are provided.
+    ``spot`` (cash/index LTP) is used only when futures quote has no LTP/book.
     """
     tok = int(fut_token)
     tick = fetch_tick_by_token(r, tok) if r is not None else None
@@ -178,34 +213,34 @@ def get_future_price(
         bid = float(tick.get("bid_price") or 0)
         ask = float(tick.get("ask_price") or 0)
         ltp = float(tick.get("last_price") or 0)
-        price, source = future_price_from_quote(bid, ask, ltp)
+        price, source = future_price_from_quote(bid, ask, ltp, spot=spot)
         if price is not None:
             return price, source
-        # Redis may only have LTP hash seed
+        # Redis may only have LTP hash seed for the future token
         ltps = fetch_ltps(r)
         seed = float(ltps.get(tok) or 0)
         if seed > 0:
             return seed, "ltp_fallback"
 
-    if not credentials:
-        return None, "none"
+    if credentials:
+        api_key = credentials.get("api_key") or ""
+        access_token = credentials.get("access_token") or ""
+        if api_key and access_token:
+            from stream.token_fetcher import fetch_quotes_from_kite
 
-    api_key = credentials.get("api_key") or ""
-    access_token = credentials.get("access_token") or ""
-    if not api_key or not access_token:
-        return None, "none"
+            quotes = fetch_quotes_from_kite(api_key, access_token, [tok])
+            q = quotes.get(tok)
+            if q:
+                return future_price_from_quote(
+                    float(q.get("bid_price") or 0),
+                    float(q.get("ask_price") or 0),
+                    float(q.get("last_price") or 0),
+                    spot=spot,
+                )
 
-    from stream.token_fetcher import fetch_quotes_from_kite
-
-    quotes = fetch_quotes_from_kite(api_key, access_token, [tok])
-    q = quotes.get(tok)
-    if not q:
-        return None, "none"
-    return future_price_from_quote(
-        float(q.get("bid_price") or 0),
-        float(q.get("ask_price") or 0),
-        float(q.get("last_price") or 0),
-    )
+    if float(spot or 0) > 0:
+        return float(spot), "spot"
+    return None, "none"
 
 
 def get_future_price_for_option(
@@ -218,6 +253,7 @@ def get_future_price_for_option(
     Resolve FUT contract + price for an option underlier/expiry.
 
     Returns ``(price, fut_meta, quote_source)``.
+    Falls back to cash/index spot when futures LTP/book are unavailable.
     """
     if credentials:
         refresh_nfo_futures(
@@ -225,11 +261,17 @@ def get_future_price_for_option(
             credentials.get("access_token") or "",
         )
 
+    cash_spot = _cash_spot_from_redis(r, underlying)
+
     fut = resolve_future(underlying, option_expiry)
     if not fut:
+        if cash_spot > 0:
+            return cash_spot, None, "spot"
         return None, None, "none"
 
-    price, source = get_future_price(r, credentials, fut["instrument_token"])
+    price, source = get_future_price(
+        r, credentials, fut["instrument_token"], spot=cash_spot,
+    )
     return price, fut, source
 
 

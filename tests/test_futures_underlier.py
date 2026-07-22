@@ -41,6 +41,18 @@ def test_future_price_none_when_empty():
     assert source == "none"
 
 
+def test_future_price_spot_last_resort():
+    price, source = future_price_from_quote(bid=0.0, ask=0.0, ltp=0.0, spot=24480.0)
+    assert source == "spot"
+    assert price == 24480.0
+
+
+def test_future_price_prefers_mid_over_spot():
+    price, source = future_price_from_quote(bid=100.0, ask=102.0, ltp=0.0, spot=24480.0)
+    assert source == "mid"
+    assert price == 101.0
+
+
 def test_resolve_future_match_kinds():
     futs = [
         {"name": "NIFTY", "instrument_token": 1, "tradingsymbol": "NIFTY26JULFUT",

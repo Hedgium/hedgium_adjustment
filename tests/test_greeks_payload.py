@@ -108,13 +108,15 @@ def test_compute_greeks_for_builder_enriches_per_leg_metadata():
         "iv": 0.0,
     }
     with patch("adjustments.greeks.get_future_price_for_option", return_value=(24500.0, {"match_kind": "exact"}, "ltp")):
-        with patch("adjustments.greeks.get_greeks_for_position", return_value=fake_greeks):
-            snap = compute_greeks_for_builder(r, builder_data)
+        with patch("adjustments.greeks.get_underlying_spot", return_value=24480.0):
+            with patch("adjustments.greeks.get_greeks_for_position", return_value=fake_greeks):
+                snap = compute_greeks_for_builder(r, builder_data)
 
     assert snap is not None
     leg = snap["per_leg"][0]
     assert leg["position_id"] == 5
     assert leg["instrument"] == "NIFTY26MAR24000CE"
     assert leg["exchange"] == "NFO"
-    assert leg["spot"] == 24500.0
+    assert leg["spot"] == 24500.0  # futures underlier used for greek math
+    assert snap["spot_by_underlying"]["NIFTY"] == 24480.0  # cash/index for greek_spot_by_underlying
     assert leg["calculated_at"]

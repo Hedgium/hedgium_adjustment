@@ -26,7 +26,7 @@ from adjustments.futures_underlier import (
     get_future_price_for_option,
     refresh_nfo_futures,
 )
-from stream.redis_writer import fetch_tick_by_token
+from stream.redis_writer import fetch_tick_by_token, resolve_underlying_zerodha_token, fetch_ltps
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,28 @@ _KITE_BATCH_SIZE = 500
 
 def _float_or_none(v) -> Optional[float]:
     return float(v) if v is not None else None
+
+
+def _cash_spot_for_underlying(r, underlying: str) -> float:
+    """Cash/index LTP from Redis for MANUAL gamma-adj."""
+    u = (underlying or "").strip().upper()
+    if not u or r is None:
+        return 0.0
+    utok = resolve_underlying_zerodha_token(r, u)
+    if not utok:
+        return 0.0
+    tick = fetch_tick_by_token(r, utok)
+    if tick:
+        try:
+            lp = float(tick.get("last_price") or 0)
+            if lp > 0:
+                return lp
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(fetch_ltps(r).get(utok) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _iso_or_none(v) -> Optional[str]:
@@ -332,13 +354,19 @@ class OptionChainStore:
         access_token = credentials.get("access_token", "")
         refresh_nfo_futures(api_key, access_token)
 
-        # 1. Futures price cache keyed by (underlying, expiry)
+        # 1. Futures price cache keyed by (underlying, expiry) — AUTO path
         fut_price_cache: dict[tuple[str, date], float] = {}
         fut_meta_cache: dict[tuple[str, date], dict] = {}
+        # Cash/index spot per underlying — MANUAL gamma-adj vs manual_delta_spot
+        cash_spot_cache: dict[str, float] = {}
         for row in chains_snapshot.values():
             u = (row.get("underlying_symbol") or "").upper()
             exp = row.get("expiry")
-            if not u or not isinstance(exp, date):
+            if not u:
+                continue
+            if u not in cash_spot_cache:
+                cash_spot_cache[u] = _cash_spot_for_underlying(r, u)
+            if not isinstance(exp, date):
                 continue
             key = (u, exp)
             if key in fut_price_cache:
@@ -407,7 +435,8 @@ class OptionChainStore:
         updates: dict[int, dict] = {}
         r_rate = FUTURES_RISK_FREE_RATE
 
-        # 3a. MANUAL path (futures F, no dividend)
+        # 3a. MANUAL path (cash spot vs manual_delta_spot; no BS)
+        # 3b. AUTO path (futures F)
         auto_candidates: list[tuple[int, dict, float, float, str]] = []
         # token, row, F, mid, flag
 
@@ -420,21 +449,23 @@ class OptionChainStore:
             if not expiry or strike is None or not option_type or not underlying:
                 continue
 
-            F = fut_price_cache.get((underlying, expiry), 0.0)
-            if F <= 0:
-                continue
-
             calc_by = (row.get("greeks_calculated_by") or "").upper()
             if calc_by == "MANUAL":
                 stored_delta = row.get("stored_delta")
                 if stored_delta is None:
+                    continue
+                cash_spot = float(cash_spot_cache.get(underlying) or 0.0)
+                if cash_spot <= 0:
                     continue
                 stored_gamma = float(row.get("stored_gamma") or 0.0)
                 stored_vega = float(row.get("stored_vega") or 0.0)
                 stored_theta = float(row.get("stored_theta") or 0.0)
                 manual_spot = row.get("manual_delta_spot")
                 if manual_spot is not None:
-                    eff_delta = (F - float(manual_spot)) * stored_gamma + float(stored_delta)
+                    eff_delta = (
+                        (cash_spot - float(manual_spot)) * stored_gamma
+                        + float(stored_delta)
+                    )
                 else:
                     eff_delta = float(stored_delta)
                 updates[token] = {
@@ -444,8 +475,12 @@ class OptionChainStore:
                     "theta": round(stored_theta, 6),
                     "vega": round(stored_vega, 6),
                     "last_greeks_at": now_iso,
-                    "computed_at_spot": F,
+                    "computed_at_spot": cash_spot,
                 }
+                continue
+
+            F = fut_price_cache.get((underlying, expiry), 0.0)
+            if F <= 0:
                 continue
 
             tick = tick_cache.get(token)
