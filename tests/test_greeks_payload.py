@@ -47,6 +47,8 @@ def test_post_adjustment_trigger_includes_position_greeks():
             strategy_id=2,
             net_delta_by_underlying={"NIFTY": 1.0},
             spot_by_underlying={"NIFTY": 24500.0},
+            future_by_underlying={"NIFTY": 24550.0},
+            future_expiry_by_underlying={"NIFTY": "2026-03-26"},
             book_positions=[],
             net_greeks={"net_delta": 1.0},
             position_greeks=[
@@ -63,6 +65,8 @@ def test_post_adjustment_trigger_includes_position_greeks():
     body = captured["json"]
     assert body["position_greeks"][0]["position_id"] == 10
     assert body["master_trade_cycle_id"] == 99
+    assert body["future_by_underlying"]["NIFTY"] == 24550.0
+    assert body["future_expiry_by_underlying"]["NIFTY"] == "2026-03-26"
 
 
 def test_compute_greeks_for_builder_enriches_per_leg_metadata():
@@ -110,7 +114,21 @@ def test_compute_greeks_for_builder_enriches_per_leg_metadata():
     with patch("adjustments.greeks.get_future_price_for_option", return_value=(24500.0, {"match_kind": "exact"}, "ltp")):
         with patch("adjustments.greeks.get_underlying_spot", return_value=24480.0):
             with patch("adjustments.greeks.get_greeks_for_position", return_value=fake_greeks):
-                snap = compute_greeks_for_builder(r, builder_data)
+                with patch(
+                    "adjustments.greeks.resolve_near_month_future",
+                    return_value={
+                        "name": "NIFTY",
+                        "instrument_token": 999,
+                        "tradingsymbol": "NIFTY26MARFUT",
+                        "expiry": date(2026, 3, 26),
+                        "match_kind": "near_month",
+                    },
+                ):
+                    with patch(
+                        "adjustments.greeks.get_future_price",
+                        return_value=(24550.0, "ltp"),
+                    ):
+                        snap = compute_greeks_for_builder(r, builder_data)
 
     assert snap is not None
     leg = snap["per_leg"][0]
@@ -119,4 +137,6 @@ def test_compute_greeks_for_builder_enriches_per_leg_metadata():
     assert leg["exchange"] == "NFO"
     assert leg["spot"] == 24500.0  # futures underlier used for greek math
     assert snap["spot_by_underlying"]["NIFTY"] == 24480.0  # cash/index for greek_spot_by_underlying
+    assert snap["future_by_underlying"]["NIFTY"] == 24550.0
+    assert snap["future_expiry_by_underlying"]["NIFTY"] == "2026-03-26"
     assert leg["calculated_at"]

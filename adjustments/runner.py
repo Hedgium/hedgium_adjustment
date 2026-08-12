@@ -202,6 +202,11 @@ class AdjustmentRunner:
                             spot_res = backend_api.post_strategy_spot_snapshot(
                                 strategy_id=sid,
                                 spot_by_underlying=snap.get("spot_by_underlying") or {},
+                                future_by_underlying=snap.get("future_by_underlying") or {},
+                                future_expiry_by_underlying=snap.get(
+                                    "future_expiry_by_underlying"
+                                )
+                                or {},
                                 reason="positions_changed_external",
                             )
                             logger.info(
@@ -221,6 +226,11 @@ class AdjustmentRunner:
                     strategy_id=int(strategy_id),
                     net_delta_by_underlying=snap["net_delta_by_underlying"],
                     spot_by_underlying=snap["spot_by_underlying"],
+                    future_by_underlying=snap.get("future_by_underlying") or {},
+                    future_expiry_by_underlying=snap.get(
+                        "future_expiry_by_underlying"
+                    )
+                    or {},
                     book_positions=snap["book_positions"],
                     net_greeks=snap.get("net_greeks"),
                     position_greeks=snap.get("per_leg"),

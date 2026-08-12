@@ -22,7 +22,9 @@ from typing import Optional
 import config as cfg
 from adjustments.futures_underlier import (
     FUTURES_RISK_FREE_RATE,
+    get_future_price,
     get_future_price_for_option,
+    resolve_near_month_future,
 )
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
 
@@ -464,19 +466,37 @@ def compute_greeks_for_builder(
     net_delta_by_underlying = {k: round(v, 6) for k, v in sorted(nd_by_u.items())}
     spot_out = {u: float(spot_by_underlying.get(u) or 0.0) for u in nd_by_u}
 
+    # Near-month futures LTP per underlying (hybrid spot-deviation)
+    future_by_underlying: dict[str, float] = {}
+    future_expiry_by_underlying: dict[str, str] = {}
+    for under in nd_by_u.keys():
+        fut = resolve_near_month_future(under)
+        if not fut:
+            continue
+        cash = float(spot_by_underlying.get(under) or 0.0)
+        price, _src = get_future_price(
+            r, credentials, int(fut["instrument_token"]), spot=cash,
+        )
+        if price is not None and float(price) > 0:
+            future_by_underlying[under] = float(price)
+            exp = fut.get("expiry")
+            if isinstance(exp, date):
+                future_expiry_by_underlying[under] = exp.isoformat()
+
     # logger.info(f"greeks_by_legs: {greeks_by_legs}")
     logger.info("")
     underlyings = sorted(nd_by_u.keys())
 
     logger.info(
         "[net-delta] builder_id=%s strategy_id=%s legs=%s "
-        "net_delta_by_underlying=%s net_gamma=%.6f cash_spot=%s",
+        "net_delta_by_underlying=%s net_gamma=%.6f cash_spot=%s near_month_fut=%s",
         builder_id,
         strategy_id,
         len(per_leg),
         {u: round(v, 4) for u, v in net_delta_by_underlying.items()},
         net_greeks.get("net_gamma", 0.0),
         {u: round(v, 2) for u, v in spot_out.items()},
+        {u: round(v, 2) for u, v in future_by_underlying.items()},
     )
     logger.info("")
 
@@ -489,6 +509,8 @@ def compute_greeks_for_builder(
         "net_greeks": net_greeks,
         "net_delta_by_underlying": net_delta_by_underlying,
         "spot_by_underlying": spot_out,
+        "future_by_underlying": future_by_underlying,
+        "future_expiry_by_underlying": future_expiry_by_underlying,
         "per_leg": per_leg,
         "book_positions": book_positions,
         "positions_open": len(positions),

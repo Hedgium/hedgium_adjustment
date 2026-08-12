@@ -195,6 +195,31 @@ def resolve_future(
     return {**chosen, "match_kind": "fallback"}
 
 
+def resolve_near_month_future(
+    underlying: str,
+    *,
+    as_of: date | str | None = None,
+) -> Optional[dict]:
+    """
+    Pick nearest NFO FUT for ``underlying`` with expiry >= as_of (default: today).
+    """
+    u = (underlying or "").strip().upper()
+    if not u:
+        return None
+    if as_of is None:
+        today = date.today()
+    else:
+        today = _parse_expiry(as_of)
+        if today is None:
+            return None
+
+    futs = [f for f in _cached_futs() if f["name"] == u and f["expiry"] >= today]
+    if not futs:
+        return None
+    chosen = sorted(futs, key=lambda f: (f["expiry"], f["tradingsymbol"]))[0]
+    return {**chosen, "match_kind": "near_month"}
+
+
 def get_future_price(
     r,
     credentials: Optional[dict],

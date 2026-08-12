@@ -326,6 +326,8 @@ def post_adjustment_trigger(
     net_greeks: dict | None = None,
     position_greeks: list[dict] | None = None,
     master_trade_cycle_id: int | None = None,
+    future_by_underlying: dict | None = None,
+    future_expiry_by_underlying: dict | None = None,
 ) -> dict:
     """
     Send worker-computed Greek snapshot to the backend for full delta-band
@@ -341,6 +343,8 @@ def post_adjustment_trigger(
         "net_delta_by_underlying": net_delta_by_underlying,
         "spot_by_underlying": spot_by_underlying,
         "book_positions": book_positions,
+        "future_by_underlying": future_by_underlying or {},
+        "future_expiry_by_underlying": future_expiry_by_underlying or {},
     }
     if net_greeks is not None:
         body["net_greeks"] = net_greeks
@@ -355,6 +359,8 @@ def post_strategy_spot_snapshot(
     strategy_id: int,
     spot_by_underlying: dict[str, float],
     reason: str | None = None,
+    future_by_underlying: dict[str, float] | None = None,
+    future_expiry_by_underlying: dict[str, str] | None = None,
 ) -> dict:
     """
     Persist per-underlying StrategySpot snapshot rows for a strategy.
@@ -362,6 +368,8 @@ def post_strategy_spot_snapshot(
     body: dict = {
         "strategy_id": strategy_id,
         "spot_by_underlying": spot_by_underlying,
+        "future_by_underlying": future_by_underlying or {},
+        "future_expiry_by_underlying": future_expiry_by_underlying or {},
     }
     if reason:
         body["reason"] = reason
