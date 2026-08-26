@@ -29,12 +29,12 @@ Auth for internal APIs: `Authorization: Bearer <INTERNAL_SERVICE_TOKEN>` (same t
 
 ## Greeks model (futures underlier)
 
-Greeks use the **NFO futures price** `F` for `(underlying, option_expiry)`, not cash/index spot.
+Greeks use the **NFO/BFO futures price** `F` for `(underlying, option_expiry)`, not cash/index spot.
 
 | Rule | Detail |
 |------|--------|
-| Contract | Exact FUT expiry match → else nearest FUT with `expiry >= option expiry` → else nearest overall |
-| Quote | Liquid LTP if `bid ≤ ltp ≤ ask`; else bid/ask mid; else LTP; else **cash/index spot** |
+| Contract | Exact FUT expiry match → listed monthly. Else nearest FUT with `expiry >= option expiry` (covering monthly) → else nearest overall |
+| Quote | Monthly: liquid LTP if `bid ≤ ltp ≤ ask`; else bid/ask mid; else LTP. Weekly before near-month FUT: `F = spot + (F_near − spot) × days_weekly / days_near`. Weekly between near and away FUT: `F = F_near + (F_away − F_near) × days_from_near_to_weekly / days_near_to_away`. If F would be cash/index **spot**: `F = spot × (1 + 0.065 × days / 365)` |
 | Dividend | Not applied (carry is already in `F`) |
 | Rate | Black–Scholes with `S = F`, `r = 0` |
 | Shared IV | Same strike CE+PE share one IV (mean of both) so `\|Δ_CE\| + \|Δ_PE\| ≈ 1` |

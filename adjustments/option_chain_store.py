@@ -313,7 +313,7 @@ class OptionChainStore:
         return sorted(pairs)
 
     def future_tokens_for_subscription(self, credentials: dict | None = None) -> list[int]:
-        """Resolve NFO FUT tokens needed for Greeks underliers."""
+        """Resolve NFO/BFO FUT tokens needed for Greeks underliers."""
         return future_tokens_for_pairs(self.underlying_expiry_pairs(), credentials)
 
     def has_fresh_greeks(self) -> bool:

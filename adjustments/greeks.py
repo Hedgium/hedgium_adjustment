@@ -339,6 +339,7 @@ def compute_greeks_for_builder(
 
     # Futures F keyed by (underlying, expiry) — used only for Greek math
     fut_by_key: dict[tuple[str, date], float] = {}
+    fut_src_by_key: dict[tuple[str, date], str] = {}
     # Cash/index LTP per underlying — persisted as greek_spot_by_underlying
     spot_by_underlying: dict[str, float] = {}
     legs = builder_data.get("legs") or []
@@ -351,6 +352,7 @@ def compute_greeks_for_builder(
 
     per_leg: list[dict] = []
     book_positions: list[dict] = []
+    leg_f_source: dict[str, str] = {}
 
     for pos in positions:
         tok = pos.get("zerodha_instrument_token")
@@ -377,10 +379,11 @@ def compute_greeks_for_builder(
 
         fkey = (under, expiry)
         if fkey not in fut_by_key:
-            price, _fut, _src = get_future_price_for_option(
+            price, _fut, src = get_future_price_for_option(
                 r, credentials, under, expiry,
             )
             fut_by_key[fkey] = float(price) if price and price > 0 else 0.0
+            fut_src_by_key[fkey] = src or ""
 
         if under not in spot_by_underlying:
             cash_spot = get_underlying_spot(r, under, leg_token_by_symbol.get(under))
@@ -428,6 +431,9 @@ def compute_greeks_for_builder(
         greeks["spot"] = fut  # futures underlier used for this greek calc
         greeks["calculated_at"] = datetime.now(timezone.utc).isoformat()
         per_leg.append(greeks)
+        inst_key = instrument or pos.get("instrument") or ""
+        if inst_key:
+            leg_f_source[inst_key] = fut_src_by_key.get(fkey, "")
         book_positions.append({
             "underlying_symbol": under,
             "option_type": option_type,
@@ -456,7 +462,13 @@ def compute_greeks_for_builder(
     for g in per_leg:
         for k in ("net_delta", "net_gamma", "net_theta", "net_vega"):
             net[k] += float(g.get(k) or 0.0)
-        greeks_by_legs[g.get("instrument")] = {k: round(float(g.get(k) or 0.0), 6) for k in ("quantity", "net_delta", "net_gamma", "net_theta", "net_vega")}
+        inst = g.get("instrument")
+        greeks_by_legs[inst] = {
+            k: round(float(g.get(k) or 0.0), 6)
+            for k in ("quantity", "net_delta", "net_gamma", "net_theta", "net_vega")
+        }
+        greeks_by_legs[inst]["F"] = round(float(g.get("spot") or 0.0), 2)
+        greeks_by_legs[inst]["F_source"] = leg_f_source.get(inst, "")
 
         u = g.get("underlying_symbol")
         if u:
@@ -483,10 +495,26 @@ def compute_greeks_for_builder(
             if isinstance(exp, date):
                 future_expiry_by_underlying[under] = exp.isoformat()
 
-    # logger.info(f"greeks_by_legs: {greeks_by_legs}")
-    logger.info("")
     underlyings = sorted(nd_by_u.keys())
 
+    # logger.info(
+    #     "[underlier-F] builder_id=%s strategy_id=%s %s",
+    #     builder_id,
+    #     strategy_id,
+    #     {
+    #         f"{u}:{exp.isoformat()}": {
+    #             "F": round(p, 2),
+    #             "source": fut_src_by_key.get((u, exp), ""),
+    #         }
+    #         for (u, exp), p in fut_by_key.items()
+    #     },
+    # )
+    # logger.info(
+    #     "greeks_by_legs: builder_id=%s strategy_id=%s %s",
+    #     builder_id,
+    #     strategy_id,
+    #     greeks_by_legs,
+    # )
     logger.info(
         "[net-delta] builder_id=%s strategy_id=%s legs=%s "
         "net_delta_by_underlying=%s net_gamma=%.6f cash_spot=%s near_month_fut=%s",
@@ -498,7 +526,6 @@ def compute_greeks_for_builder(
         {u: round(v, 2) for u, v in spot_out.items()},
         {u: round(v, 2) for u, v in future_by_underlying.items()},
     )
-    logger.info("")
 
     return {
         "builder_id": builder_id,

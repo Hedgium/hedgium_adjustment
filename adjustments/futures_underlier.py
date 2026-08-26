@@ -1,8 +1,10 @@
 """
-NFO futures underlier resolution for Greeks.
+NFO/BFO futures underlier resolution for Greeks.
 
 Selects the futures contract for ``(underlying, option_expiry)`` and prices it
-with the liquid-LTP vs bid/ask-mid rule.
+with the liquid-LTP vs bid/ask-mid rule. Weekly expiries (no listed FUT) use a
+synthetic price interpolated from cash/index spot and the covering monthly FUT.
+When no future quote exists, cash/index spot is carried with simple interest.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import time
 from datetime import date, datetime
 from typing import Optional
 
+from market_sessions import IST
 from stream.redis_writer import fetch_tick_by_token, fetch_ltps
 
 logger = logging.getLogger(__name__)
@@ -20,8 +23,12 @@ logger = logging.getLogger(__name__)
 # BS rate when underlier is a futures price (carry already in F).
 FUTURES_RISK_FREE_RATE = 0.0
 
-# Refresh Kite NFO instrument dump at most this often.
+# Simple interest when F falls back to cash/index spot (no listed future quote).
+SPOT_INTEREST_RATE = 0.065
+
+# Refresh Kite NFO/BFO instrument dump at most this often.
 _NFO_CACHE_TTL_S = 6 * 3600
+_FUT_EXCHANGES = ("NFO", "BFO")
 
 _lock = threading.Lock()
 _nfo_futs: list[dict] = []
@@ -104,9 +111,93 @@ def _parse_expiry(raw) -> Optional[date]:
         return None
 
 
+def _ist_today() -> date:
+    return datetime.now(IST).date()
+
+
+def synthetic_weekly_future_price(
+    spot: float,
+    monthly_price: Optional[float],
+    days_to_weekly: int,
+    days_to_monthly: int,
+) -> Optional[float]:
+    """
+    Linear calendar-day interpolation onto a weekly expiry.
+
+    Spot-to-near: ``F = spot + (F_near - spot) * days_weekly / days_near``
+    Near-to-away: ``F = F_near + (F_away - F_near) * days_weekly / days_span``
+    (same helper; first two args are the two anchors).
+    """
+    try:
+        spot_f = float(spot or 0)
+    except (TypeError, ValueError):
+        return None
+    if spot_f <= 0 or monthly_price is None:
+        return None
+    try:
+        monthly_f = float(monthly_price)
+    except (TypeError, ValueError):
+        return None
+    if monthly_f <= 0:
+        return None
+    if int(days_to_monthly) <= 0:
+        return monthly_f
+    if int(days_to_weekly) <= 0:
+        return spot_f
+    if int(days_to_weekly) >= int(days_to_monthly):
+        return monthly_f
+    return spot_f + (monthly_f - spot_f) * (int(days_to_weekly) / int(days_to_monthly))
+
+
+def spot_with_interest(
+    spot: float,
+    days_to_expiry: int,
+    rate: float = SPOT_INTEREST_RATE,
+) -> Optional[float]:
+    """
+    Cash/index spot plus simple interest to option expiry.
+
+    ``F = spot * (1 + r * days / 365)``. Expiry day (days ≤ 0) returns spot.
+    """
+    try:
+        spot_f = float(spot or 0)
+        rate_f = float(rate)
+    except (TypeError, ValueError):
+        return None
+    if spot_f <= 0:
+        return None
+    days = int(days_to_expiry)
+    if days <= 0:
+        return spot_f
+    return spot_f * (1.0 + rate_f * days / 365.0)
+
+
+def _spot_interest_underlier(
+    underlying: str,
+    option_expiry: date | str,
+    spot: float,
+) -> tuple[Optional[float], str]:
+    today = _ist_today()
+    exp = _parse_expiry(option_expiry)
+    days = (exp - today).days if exp is not None else 0
+    price = spot_with_interest(spot, days)
+    if price is None:
+        return None, "none"
+    # logger.info(
+    #     "[spot-interest] underlying=%s option_expiry=%s spot=%.2f days=%s r=%.4f F=%.2f",
+    #     underlying,
+    #     exp,
+    #     float(spot),
+    #     days,
+    #     SPOT_INTEREST_RATE,
+    #     price,
+    # )
+    return price, "spot_interest"
+
+
 def refresh_nfo_futures(api_key: str, access_token: str, *, force: bool = False) -> int:
     """
-    Load / refresh in-memory NFO FUT instruments from Kite.
+    Load / refresh in-memory NFO and BFO FUT instruments from Kite.
 
     Returns the number of FUT rows cached.
     """
@@ -125,33 +216,48 @@ def refresh_nfo_futures(api_key: str, access_token: str, *, force: bool = False)
 
         kite = KiteConnect(api_key=api_key)
         kite.set_access_token(access_token)
-        rows = kite.instruments("NFO") or []
     except Exception as exc:
-        logger.warning("futures_underlier: instruments(NFO) failed: %s", exc)
+        logger.warning("futures_underlier: KiteConnect init failed: %s", exc)
         with _lock:
             return len(_nfo_futs)
 
     futs: list[dict] = []
-    for row in rows:
-        if (row.get("instrument_type") or "").upper() != "FUT":
+    fetched_any = False
+    for exchange in _FUT_EXCHANGES:
+        try:
+            rows = kite.instruments(exchange) or []
+        except Exception as exc:
+            logger.warning("futures_underlier: instruments(%s) failed: %s", exchange, exc)
             continue
-        name = (row.get("name") or "").strip().upper()
-        tok = row.get("instrument_token")
-        exp = _parse_expiry(row.get("expiry"))
-        if not name or tok is None or exp is None:
-            continue
-        futs.append({
-            "name": name,
-            "instrument_token": int(tok),
-            "tradingsymbol": row.get("tradingsymbol") or "",
-            "expiry": exp,
-        })
+        fetched_any = True
+        for row in rows:
+            if (row.get("instrument_type") or "").upper() != "FUT":
+                continue
+            name = (row.get("name") or "").strip().upper()
+            tok = row.get("instrument_token")
+            exp = _parse_expiry(row.get("expiry"))
+            if not name or tok is None or exp is None:
+                continue
+            futs.append({
+                "name": name,
+                "instrument_token": int(tok),
+                "tradingsymbol": row.get("tradingsymbol") or "",
+                "expiry": exp,
+                "exchange": exchange,
+            })
+
+    if not fetched_any:
+        with _lock:
+            return len(_nfo_futs)
 
     with _lock:
         _nfo_futs = futs
         _nfo_loaded_at = time.monotonic()
 
-    logger.info("futures_underlier: cached %s NFO FUT instruments", len(futs))
+    logger.info(
+        "futures_underlier: cached %s NFO/BFO FUT instruments",
+        len(futs),
+    )
     return len(futs)
 
 
@@ -165,7 +271,7 @@ def resolve_future(
     option_expiry: date | str,
 ) -> Optional[dict]:
     """
-    Pick NFO future for ``underlying`` matching ``option_expiry``.
+    Pick NFO/BFO future for ``underlying`` matching ``option_expiry``.
 
     Preference:
       1. exact expiry match
@@ -201,7 +307,7 @@ def resolve_near_month_future(
     as_of: date | str | None = None,
 ) -> Optional[dict]:
     """
-    Pick nearest NFO FUT for ``underlying`` with expiry >= as_of (default: today).
+    Pick nearest NFO/BFO FUT for ``underlying`` with expiry >= as_of (default: today).
     """
     u = (underlying or "").strip().upper()
     if not u:
@@ -218,6 +324,22 @@ def resolve_near_month_future(
         return None
     chosen = sorted(futs, key=lambda f: (f["expiry"], f["tradingsymbol"]))[0]
     return {**chosen, "match_kind": "near_month"}
+
+
+def resolve_away_month_future(
+    underlying: str,
+    near_expiry: date | str,
+) -> Optional[dict]:
+    """Pick the next NFO/BFO FUT for ``underlying`` with expiry strictly after ``near_expiry``."""
+    u = (underlying or "").strip().upper()
+    exp = _parse_expiry(near_expiry)
+    if not u or exp is None:
+        return None
+    futs = [f for f in _cached_futs() if f["name"] == u and f["expiry"] > exp]
+    if not futs:
+        return None
+    chosen = sorted(futs, key=lambda f: (f["expiry"], f["tradingsymbol"]))[0]
+    return {**chosen, "match_kind": "away_month"}
 
 
 def get_future_price(
@@ -277,8 +399,13 @@ def get_future_price_for_option(
     """
     Resolve FUT contract + price for an option underlier/expiry.
 
+    Monthly expiries (exact FUT match) use the listed quote.
+    Weeklies before the near-month FUT: synthetic from spot and near-month.
+    Weeklies between near-month and away-month: synthetic from those two FUTs.
+
     Returns ``(price, fut_meta, quote_source)``.
-    Falls back to cash/index spot when futures LTP/book are unavailable.
+    Falls back to cash/index spot plus simple interest when futures
+    LTP/book are unavailable.
     """
     if credentials:
         refresh_nfo_futures(
@@ -291,12 +418,94 @@ def get_future_price_for_option(
     fut = resolve_future(underlying, option_expiry)
     if not fut:
         if cash_spot > 0:
-            return cash_spot, None, "spot"
+            price, source = _spot_interest_underlier(
+                underlying, option_expiry, cash_spot,
+            )
+            return price, None, source
         return None, None, "none"
 
     price, source = get_future_price(
         r, credentials, fut["instrument_token"], spot=cash_spot,
     )
+    if source == "spot":
+        carried, src = _spot_interest_underlier(
+            underlying, option_expiry, cash_spot if cash_spot > 0 else float(price or 0),
+        )
+        return carried, fut, src
+    if fut.get("match_kind") == "exact":
+        return price, fut, source
+
+    today = _ist_today()
+    opt_exp = _parse_expiry(option_expiry)
+    near = resolve_near_month_future(underlying, as_of=today)
+    away = None
+    if near:
+        away = resolve_away_month_future(underlying, near["expiry"])
+
+    between_two = (
+        near is not None
+        and away is not None
+        and opt_exp is not None
+        and near["expiry"] < opt_exp <= away["expiry"]
+        and int(near["instrument_token"]) != int(away["instrument_token"])
+    )
+
+    if between_two:
+        p_near, src_near = get_future_price(
+            r, credentials, int(near["instrument_token"]), spot=cash_spot,
+        )
+        p_away = price
+        if (
+            src_near != "spot"
+            and p_near is not None
+            and float(p_near) > 0
+            and p_away is not None
+            and float(p_away) > 0
+        ):
+            d_weekly = (opt_exp - near["expiry"]).days
+            d_span = (away["expiry"] - near["expiry"]).days
+            synth = synthetic_weekly_future_price(
+                float(p_near), float(p_away), d_weekly, d_span,
+            )
+            if synth is not None:
+                # logger.info(
+                #     "[synthetic-F] underlying=%s option_expiry=%s "
+                #     "near=%s away=%s F_near=%.2f F_away=%.2f "
+                #     "d_weekly=%s d_span=%s F=%.2f",
+                #     underlying,
+                #     opt_exp,
+                #     near.get("tradingsymbol"),
+                #     away.get("tradingsymbol"),
+                #     float(p_near),
+                #     float(p_away),
+                #     d_weekly,
+                #     d_span,
+                #     synth,
+                # )
+                return synth, away, "synthetic"
+
+    if cash_spot > 0 and price is not None and float(price) > 0:
+        monthly_exp = _parse_expiry(fut.get("expiry"))
+        days_to_weekly = (opt_exp - today).days if opt_exp is not None else 0
+        days_to_monthly = (monthly_exp - today).days if monthly_exp is not None else 0
+        synth = synthetic_weekly_future_price(
+            cash_spot, price, days_to_weekly, days_to_monthly,
+        )
+        if synth is not None:
+            # logger.info(
+            #     "[synthetic-F] underlying=%s option_expiry=%s covering=%s "
+            #     "spot=%.2f monthly_F=%.2f d_weekly=%s d_monthly=%s F=%.2f",
+            #     underlying,
+            #     opt_exp,
+            #     fut.get("tradingsymbol") or monthly_exp,
+            #     cash_spot,
+            #     float(price),
+            #     days_to_weekly,
+            #     days_to_monthly,
+            #     synth,
+            # )
+            return synth, fut, "synthetic"
+
     return price, fut, source
 
 
@@ -315,4 +524,10 @@ def future_tokens_for_pairs(
         fut = resolve_future(underlying, expiry)
         if fut:
             tokens.add(int(fut["instrument_token"]))
+        near = resolve_near_month_future(underlying)
+        if near:
+            tokens.add(int(near["instrument_token"]))
+            away = resolve_away_month_future(underlying, near["expiry"])
+            if away:
+                tokens.add(int(away["instrument_token"]))
     return sorted(tokens)

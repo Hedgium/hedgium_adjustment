@@ -464,6 +464,19 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         def on_ticks(ticks: list):
             try:
                 write_ticks_batch(r, ticks)
+                ltp_map: dict[int, float] = {}
+                for t in ticks:
+                    tok = t.get("instrument_token")
+                    if tok is None:
+                        continue
+                    try:
+                        lp = float(t.get("last_price") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if lp > 0:
+                        ltp_map[int(tok)] = lp
+                if ltp_map:
+                    write_ltps(r, ltp_map)
                 tick_q.put(list(ticks))
             except Exception:
                 logger.exception("worker: Redis write failed")
