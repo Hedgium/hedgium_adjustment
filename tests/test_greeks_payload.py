@@ -32,6 +32,60 @@ def test_get_greeks_for_position_short_quantity_signs():
     assert greeks["net_gamma"] < 0
 
 
+def test_get_greeks_for_position_applies_quote_unit():
+    """GOLDM: qty 100 / quote_unit 10 → nets use money_qty 10, not 100."""
+    r = MagicMock()
+    with patch("adjustments.greeks.fetch_tick_by_token", return_value={"bid_price": 10, "ask_price": 12, "last_price": 11}):
+        with patch("adjustments.greeks._stored_greeks_fresh", return_value=True):
+            greeks = get_greeks_for_position(
+                r,
+                zerodha_instrument_token=123,
+                underlying_spot=100.0,
+                strike=100.0,
+                option_type="CE",
+                expiry=date(2026, 3, 27),
+                quantity=100,
+                instrument_label="GOLDM26SEP170000CE",
+                quote_unit=10,
+                stored_chain={
+                    "delta": 0.5,
+                    "gamma": 0.01,
+                    "theta": -1.0,
+                    "vega": 2.0,
+                    "computed_at_spot": 100.0,
+                    "last_greeks_at": "2026-03-21T10:00:00",
+                },
+            )
+    assert greeks is not None
+    # delta_pu=0.5 at same spot → net_delta = 0.5 * (100/10) = 5
+    assert greeks["net_delta"] == 5.0
+    assert greeks["net_gamma"] == 0.1
+    assert greeks["quote_unit"] == 10.0
+
+
+def test_normalize_live_zerodha_mcx_expands_lot_count():
+    from adjustments.positions_manager import _normalize_live_position
+
+    row = _normalize_live_position(
+        {
+            "tradingsymbol": "GOLDM26SEP170000CE",
+            "exchange": "MCX",
+            "quantity": 1,
+            "broker_name": "ZERODHA",
+            "lot_size": 100,
+            "quote_unit": 10,
+            "instrument_token": 501,
+            "underlying_symbol": "GOLDM",
+            "strike": 170000,
+            "option_type": "CE",
+            "expiry": "2026-09-25",
+        }
+    )
+    assert row["quantity"] == 100
+    assert row["quote_unit"] == 10.0
+    assert row["lot_size"] == 100
+
+
 def test_post_adjustment_trigger_includes_position_greeks():
     from client import backend_api
 
@@ -87,6 +141,7 @@ def test_compute_greeks_for_builder_enriches_per_leg_metadata():
                 "quantity": 50,
                 "exchange": "NFO",
                 "lot_size": 1,
+                "quote_unit": 1,
                 "instrument": "NIFTY26MAR24000CE",
             }
         ],

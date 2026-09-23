@@ -140,11 +140,15 @@ def get_greeks_for_position(
     instrument_label: str,
     stored_chain: Optional[dict] = None,
     dividend: Optional[dict] = None,
+    quote_unit: float = 1.0,
 ) -> Optional[dict]:
     """
     Compute net Greeks for one position for the adjustment check.
 
     ``underlying_spot`` is the futures underlier ``F`` (no dividend adjustment).
+
+    ``quote_unit`` scales money/risk nets: net_* = per_unit × qty / quote_unit
+    (MCX gold is quoted ₹/10g; GOLDM qty=100 → quote_unit=10).
 
     Path 1 — Gamma-adjusted (in-memory baseline is fresh)
         Uses the delta/gamma/spot stored by the last ``update_greeks()`` run.
@@ -249,6 +253,13 @@ def get_greeks_for_position(
     q    = quantity
     sign = 1 if q > 0 else -1 if q < 0 else 0
     aq   = abs(q)
+    try:
+        qu = float(quote_unit) if quote_unit is not None else 1.0
+    except (TypeError, ValueError):
+        qu = 1.0
+    if qu <= 0:
+        qu = 1.0
+    money_qty = aq / qu
 
     return {
         "instrument":              instrument_label,
@@ -262,11 +273,12 @@ def get_greeks_for_position(
         "gamma":     gamma_pu,
         "theta":     theta_pu,
         "vega":      vega_pu,
-        "net_delta": round(delta_pu * aq * sign, 6),
-        "net_gamma": round(gamma_pu * aq * sign, 6),
-        "net_theta": round(theta_pu * aq * sign, 6),
-        "net_vega":  round(vega_pu  * aq * sign, 6),
+        "net_delta": round(delta_pu * money_qty * sign, 6),
+        "net_gamma": round(gamma_pu * money_qty * sign, 6),
+        "net_theta": round(theta_pu * money_qty * sign, 6),
+        "net_vega":  round(vega_pu  * money_qty * sign, 6),
         "quantity":  q,
+        "quote_unit": qu,
         "greeks_source": path,
     }
 
@@ -363,6 +375,7 @@ def compute_greeks_for_builder(
         quantity = pos.get("quantity", 0)
         exchange = pos.get("exchange") or "NFO"
         lot_size = pos.get("lot_size") or 1
+        quote_unit = pos.get("quote_unit") or 1
         instrument = pos.get("instrument") or ""
 
         if not tok or not under or not strike or not option_type or not expiry_str:
@@ -413,6 +426,7 @@ def compute_greeks_for_builder(
             instrument_label=instrument,
             stored_chain=stored_chain,
             dividend=None,
+            quote_unit=float(quote_unit or 1),
         )
 
         if greeks is None:
@@ -442,6 +456,7 @@ def compute_greeks_for_builder(
             "exchange": exchange,
             "zerodha_tradingsymbol": pos.get("zerodha_tradingsymbol") or "",
             "lot_size": int(lot_size),
+            "quote_unit": float(quote_unit or 1),
             "expiry": expiry_str,
             "bid": float(greeks.get("bid") or 0.0),
             "ask": float(greeks.get("ask") or 0.0),

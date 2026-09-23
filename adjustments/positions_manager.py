@@ -349,7 +349,11 @@ def _normalize_live_position(pos: dict) -> dict:
 
         {position_id, instrument, quantity, exchange,
          zerodha_instrument_token, underlying_symbol, strike,
-         option_type, expiry (ISO str), lot_size}
+         option_type, expiry (ISO str), lot_size, quote_unit}
+
+    Zerodha MCX/CDS broker quantity is lot count; expand to canonical economic
+    units so quote_unit scaling in get_greeks_for_position is consistent with
+    Hedgium book qty.
     """
     expiry_raw = pos.get("expiry")
     qty = pos.get("quantity") or 0
@@ -357,16 +361,31 @@ def _normalize_live_position(pos: dict) -> dict:
         qty_int = int(float(qty))
     except (TypeError, ValueError):
         qty_int = 0
+    exchange = (pos.get("exchange") or "NFO").strip().upper() or "NFO"
+    lot_size = max(1, int(pos.get("lot_size") or 1))
+    try:
+        quote_unit = float(pos.get("quote_unit") or 1)
+    except (TypeError, ValueError):
+        quote_unit = 1.0
+    if quote_unit <= 0:
+        quote_unit = 1.0
+
+    broker = (pos.get("broker_name") or "").strip().upper()
+    # Zerodha MCX/CDS APIs use lot count; Hedgium Greeks expect economic units.
+    if broker == "ZERODHA" and exchange in {"MCX", "CDS"} and lot_size > 1:
+        qty_int = qty_int * lot_size
+
     return {
         "position_id": None,
         "instrument": pos.get("tradingsymbol") or "",
         "quantity": qty_int,
-        "exchange": (pos.get("exchange") or "NFO").strip().upper() or "NFO",
+        "exchange": exchange,
         "zerodha_instrument_token": pos.get("instrument_token"),
         "underlying_symbol": (pos.get("underlying_symbol") or "").strip().upper() or None,
         "strike": pos.get("strike"),
         "option_type": pos.get("option_type"),
         "expiry": expiry_raw,
-        "lot_size": int(pos.get("lot_size") or 1),
+        "lot_size": lot_size,
+        "quote_unit": quote_unit,
         "broker_name": pos.get("broker_name") or "",
     }

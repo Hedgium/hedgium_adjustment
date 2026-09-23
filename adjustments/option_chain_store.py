@@ -41,6 +41,14 @@ def _float_or_none(v) -> Optional[float]:
     return float(v) if v is not None else None
 
 
+def _positive_float(v, default: float = 1.0) -> float:
+    try:
+        value = float(v) if v is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else float(default)
+
+
 def _cash_spot_for_underlying(r, underlying: str) -> float:
     """Cash/index LTP from Redis for MANUAL gamma-adj."""
     u = (underlying or "").strip().upper()
@@ -260,6 +268,7 @@ class OptionChainStore:
                 "option_type": row.get("option_type") or "",
                 "expiry": expiry,
                 "lot_size": int(row.get("lot_size") or 1),
+                "quote_unit": _positive_float(row.get("quote_unit"), 1.0),
                 "zerodha_tradingsymbol": row.get("zerodha_tradingsymbol") or "",
                 "shoonya_tradingsymbol": row.get("shoonya_tradingsymbol") or "",
                 "kotakneo_tradingsymbol": row.get("kotakneo_tradingsymbol") or "",

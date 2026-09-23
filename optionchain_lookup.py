@@ -106,6 +106,11 @@ def enrich_positions_with_option_chain(
             p["option_type"] = chain.get("option_type")
             p["expiry"] = expiry.isoformat() if hasattr(expiry, "isoformat") else expiry
             p["lot_size"] = int(chain.get("lot_size") or 1)
+            try:
+                qu = float(chain.get("quote_unit") or 1)
+            except (TypeError, ValueError):
+                qu = 1.0
+            p["quote_unit"] = qu if qu > 0 else 1.0
             p["zerodha_tradingsymbol"] = chain.get("zerodha_tradingsymbol") or ""
         else:
             logger.warning(
@@ -119,6 +124,7 @@ def enrich_positions_with_option_chain(
             p.setdefault("option_type", None)
             p.setdefault("expiry", None)
             p.setdefault("lot_size", 1)
+            p.setdefault("quote_unit", 1.0)
             p.setdefault("zerodha_tradingsymbol", "")
 
         enriched.append(p)
