@@ -309,20 +309,21 @@ class OptionChainStore:
         with self._lock:
             return len(self._chains)
 
-    def underlying_expiry_pairs(self) -> list[tuple[str, date]]:
-        """Unique ``(underlying_symbol, expiry)`` pairs present in the store."""
+    def underlying_expiry_pairs(self) -> list[tuple[str, date, str]]:
+        """Unique ``(underlying_symbol, expiry, exchange)`` triples in the store."""
         with self._lock:
             rows = list(self._chains.values())
-        pairs: set[tuple[str, date]] = set()
+        pairs: set[tuple[str, date, str]] = set()
         for row in rows:
             u = (row.get("underlying_symbol") or "").upper()
             exp = row.get("expiry")
+            ex = (row.get("exchange") or "NFO").strip().upper() or "NFO"
             if u and isinstance(exp, date):
-                pairs.add((u, exp))
+                pairs.add((u, exp, ex))
         return sorted(pairs)
 
     def future_tokens_for_subscription(self, credentials: dict | None = None) -> list[int]:
-        """Resolve NFO/BFO FUT tokens needed for Greeks underliers."""
+        """Resolve NFO/BFO/NCO FUT tokens needed for Greeks underliers."""
         return future_tokens_for_pairs(self.underlying_expiry_pairs(), credentials)
 
     def has_fresh_greeks(self) -> bool:
@@ -347,7 +348,7 @@ class OptionChainStore:
         """
         Recompute IV + BS Greeks for every chain row using futures underlier ``F``.
 
-        Underlier: NFO future matched to option expiry; price = liquid LTP else
+        Underlier: future on the option's exchange matched to expiry; price = liquid LTP else
         bid/ask mid (no dividend).  BS uses ``r=0``.  When both CE and PE mids
         exist for a strike, a shared IV is used so ``|Δ_CE|+|Δ_PE|≈1``.
 
@@ -363,24 +364,27 @@ class OptionChainStore:
         access_token = credentials.get("access_token", "")
         refresh_nfo_futures(api_key, access_token)
 
-        # 1. Futures price cache keyed by (underlying, expiry) — AUTO path
-        fut_price_cache: dict[tuple[str, date], float] = {}
-        fut_meta_cache: dict[tuple[str, date], dict] = {}
+        # 1. Futures price cache keyed by (underlying, expiry, exchange) — AUTO path
+        fut_price_cache: dict[tuple[str, date, str], float] = {}
+        fut_meta_cache: dict[tuple[str, date, str], dict] = {}
         # Cash/index spot per underlying — MANUAL gamma-adj vs manual_delta_spot
         cash_spot_cache: dict[str, float] = {}
         for row in chains_snapshot.values():
             u = (row.get("underlying_symbol") or "").upper()
             exp = row.get("expiry")
+            ex = (row.get("exchange") or "NFO").strip().upper() or "NFO"
             if not u:
                 continue
             if u not in cash_spot_cache:
                 cash_spot_cache[u] = _cash_spot_for_underlying(r, u)
             if not isinstance(exp, date):
                 continue
-            key = (u, exp)
+            key = (u, exp, ex)
             if key in fut_price_cache:
                 continue
-            price, fut, _src = get_future_price_for_option(r, credentials, u, exp)
+            price, fut, _src = get_future_price_for_option(
+                r, credentials, u, exp, exchange=ex,
+            )
             if price is not None and price > 0:
                 fut_price_cache[key] = float(price)
             if fut:
@@ -454,6 +458,7 @@ class OptionChainStore:
             strike = row.get("strike")
             option_type = row.get("option_type", "")
             underlying = (row.get("underlying_symbol") or "").upper()
+            exchange = (row.get("exchange") or "NFO").strip().upper() or "NFO"
 
             if not expiry or strike is None or not option_type or not underlying:
                 continue
@@ -488,7 +493,7 @@ class OptionChainStore:
                 }
                 continue
 
-            F = fut_price_cache.get((underlying, expiry), 0.0)
+            F = fut_price_cache.get((underlying, expiry, exchange), 0.0)
             if F <= 0:
                 continue
 
@@ -511,6 +516,7 @@ class OptionChainStore:
             key = (
                 row["underlying_symbol"],
                 row["expiry"],
+                (row.get("exchange") or "NFO").strip().upper() or "NFO",
                 float(row["strike"]),
             )
             groups[key].append(item)

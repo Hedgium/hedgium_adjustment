@@ -1,7 +1,8 @@
 """
 Standalone Greek computation for the worker.
 
-Uses NFO futures underlier ``F`` matched to option expiry (no dividend), with
+Uses the option exchange's futures underlier ``F`` (NFO, BFO, or NCO) matched to
+option expiry (no dividend), with
 Black-Scholes at ``r=0``:
 
   1. Gamma-adjusted — stored delta adjusted for futures move via stored gamma.
@@ -330,7 +331,7 @@ def compute_greeks_for_builder(
     ``builder_data`` is one item from ``/internal/adjustments/builders``
     ``builders`` list.
 
-    Underlier is the NFO futures price matched to each position's expiry
+    Underlier is the futures price on the position's exchange, matched to expiry
     (no dividend).  ``credentials`` enables Kite quote fallback when Redis
     has no futures tick yet.
 
@@ -349,9 +350,10 @@ def compute_greeks_for_builder(
     if not positions:
         return None
 
-    # Futures F keyed by (underlying, expiry) — used only for Greek math
-    fut_by_key: dict[tuple[str, date], float] = {}
-    fut_src_by_key: dict[tuple[str, date], str] = {}
+    # Futures F keyed by (underlying, expiry, exchange) — used only for Greek math
+    fut_by_key: dict[tuple[str, date, str], float] = {}
+    fut_src_by_key: dict[tuple[str, date, str], str] = {}
+    exchange_by_underlying: dict[str, str] = {}
     # Cash/index LTP per underlying — persisted as greek_spot_by_underlying
     spot_by_underlying: dict[str, float] = {}
     legs = builder_data.get("legs") or []
@@ -373,7 +375,7 @@ def compute_greeks_for_builder(
         option_type = pos.get("option_type")
         expiry_str = pos.get("expiry")
         quantity = pos.get("quantity", 0)
-        exchange = pos.get("exchange") or "NFO"
+        exchange = (pos.get("exchange") or "NFO").strip().upper() or "NFO"
         lot_size = pos.get("lot_size") or 1
         quote_unit = pos.get("quote_unit") or 1
         instrument = pos.get("instrument") or ""
@@ -390,10 +392,11 @@ def compute_greeks_for_builder(
             )
             continue
 
-        fkey = (under, expiry)
+        fkey = (under, expiry, exchange)
+        exchange_by_underlying.setdefault(under, exchange)
         if fkey not in fut_by_key:
             price, _fut, src = get_future_price_for_option(
-                r, credentials, under, expiry,
+                r, credentials, under, expiry, exchange=exchange,
             )
             fut_by_key[fkey] = float(price) if price and price > 0 else 0.0
             fut_src_by_key[fkey] = src or ""
@@ -497,7 +500,9 @@ def compute_greeks_for_builder(
     future_by_underlying: dict[str, float] = {}
     future_expiry_by_underlying: dict[str, str] = {}
     for under in nd_by_u.keys():
-        fut = resolve_near_month_future(under)
+        fut = resolve_near_month_future(
+            under, exchange=exchange_by_underlying.get(under),
+        )
         if not fut:
             continue
         cash = float(spot_by_underlying.get(under) or 0.0)

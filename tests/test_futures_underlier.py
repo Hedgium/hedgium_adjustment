@@ -354,6 +354,69 @@ def test_option_chain_store_update_greeks_uses_futures_no_dividend():
     assert ce["computed_at_spot"] == 24500.0
 
 
+def test_resolve_future_nco_stays_on_nco():
+    futs = [
+        {"name": "CRUDEOIL", "instrument_token": 11, "tradingsymbol": "CRUDEOIL26OCTFUT",
+         "expiry": date(2026, 10, 19), "exchange": "MCX"},
+        {"name": "CRUDEOIL", "instrument_token": 22, "tradingsymbol": "CRUDEOIL26OCTFUT",
+         "expiry": date(2026, 10, 19), "exchange": "NCO"},
+    ]
+    with patch("adjustments.futures_underlier._cached_futs", return_value=futs):
+        nco = resolve_future("CRUDEOIL", date(2026, 10, 19), exchange="NCO")
+        assert nco is not None
+        assert nco["instrument_token"] == 22
+        assert nco["match_kind"] == "exact"
+        mcx = resolve_future("CRUDEOIL", date(2026, 10, 19), exchange="MCX")
+        assert mcx is not None
+        assert mcx["instrument_token"] == 11
+        assert resolve_future("CRUDEOIL", date(2026, 10, 19), exchange="NFO") is None
+
+
+def test_refresh_nfo_futures_loads_nco():
+    nco_rows = [{
+        "instrument_type": "FUT",
+        "name": "CRUDEOIL",
+        "instrument_token": 22,
+        "tradingsymbol": "CRUDEOIL26OCTFUT",
+        "expiry": date(2026, 10, 19),
+    }]
+
+    class FakeKite:
+        def __init__(self, api_key):
+            pass
+
+        def set_access_token(self, token):
+            pass
+
+        def instruments(self, exchange):
+            if exchange == "NCO":
+                return nco_rows
+            return []
+
+    import adjustments.futures_underlier as fu
+    from adjustments.futures_underlier import future_tokens_for_pairs
+
+    with patch("kiteconnect.KiteConnect", FakeKite):
+        try:
+            n = refresh_nfo_futures("k", "t", force=True)
+            assert n == 1
+            fut = resolve_future("CRUDEOIL", date(2026, 10, 19), exchange="NCO")
+            assert fut is not None
+            assert fut["instrument_token"] == 22
+            assert fut["exchange"] == "NCO"
+            tokens = future_tokens_for_pairs([
+                ("CRUDEOIL", date(2026, 10, 19), "NCO"),
+            ])
+            assert tokens == [22]
+            assert future_tokens_for_pairs([
+                ("CRUDEOIL", date(2026, 10, 19), "NFO"),
+            ]) == []
+        finally:
+            with fu._lock:
+                fu._nfo_futs = []
+                fu._nfo_loaded_at = 0.0
+
+
 def test_refresh_nfo_futures_loads_bfo_and_nfo():
     nfo_rows = [{
         "instrument_type": "FUT",

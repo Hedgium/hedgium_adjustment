@@ -1,5 +1,5 @@
 """
-NFO/BFO futures underlier resolution for Greeks.
+NFO/BFO/NCO futures underlier resolution for Greeks.
 
 Selects the futures contract for ``(underlying, option_expiry)`` and prices it
 with the liquid-LTP vs bid/ask-mid rule. Weekly expiries (no listed FUT) use a
@@ -26,9 +26,9 @@ FUTURES_RISK_FREE_RATE = 0.0
 # Simple interest when F falls back to cash/index spot (no listed future quote).
 SPOT_INTEREST_RATE = 0.065
 
-# Refresh Kite NFO/BFO instrument dump at most this often.
+# Refresh Kite FUT instrument dump at most this often.
 _NFO_CACHE_TTL_S = 6 * 3600
-_FUT_EXCHANGES = ("NFO", "BFO")
+_FUT_EXCHANGES = ("NFO", "BFO", "NCO")
 
 _lock = threading.Lock()
 _nfo_futs: list[dict] = []
@@ -197,7 +197,7 @@ def _spot_interest_underlier(
 
 def refresh_nfo_futures(api_key: str, access_token: str, *, force: bool = False) -> int:
     """
-    Load / refresh in-memory NFO and BFO FUT instruments from Kite.
+    Load / refresh in-memory NFO, BFO, and NCO FUT instruments from Kite.
 
     Returns the number of FUT rows cached.
     """
@@ -254,9 +254,11 @@ def refresh_nfo_futures(api_key: str, access_token: str, *, force: bool = False)
         _nfo_futs = futs
         _nfo_loaded_at = time.monotonic()
 
+    by_ex = {ex: sum(1 for f in futs if f["exchange"] == ex) for ex in _FUT_EXCHANGES}
     logger.info(
-        "futures_underlier: cached %s NFO/BFO FUT instruments",
+        "futures_underlier: cached %s FUT instruments (%s)",
         len(futs),
+        ", ".join(f"{ex}={by_ex[ex]}" for ex in _FUT_EXCHANGES),
     )
     return len(futs)
 
@@ -266,24 +268,41 @@ def _cached_futs() -> list[dict]:
         return list(_nfo_futs)
 
 
+def _futs_named(underlying: str, exchange: str | None = None) -> list[dict]:
+    """
+    Cached FUT rows for ``underlying``.
+
+    When ``exchange`` is set, only that exchange is returned so an NCO option
+    does not pick an MCX or NFO contract with the same name.
+    """
+    u = (underlying or "").strip().upper()
+    if not u:
+        return []
+    futs = [f for f in _cached_futs() if f["name"] == u]
+    ex = (exchange or "").strip().upper()
+    if not ex:
+        return futs
+    return [f for f in futs if (f.get("exchange") or "").strip().upper() == ex]
+
+
 def resolve_future(
     underlying: str,
     option_expiry: date | str,
+    exchange: str | None = None,
 ) -> Optional[dict]:
     """
-    Pick NFO/BFO future for ``underlying`` matching ``option_expiry``.
+    Pick a future for ``underlying`` matching ``option_expiry``.
 
-    Preference:
+    ``exchange`` restricts the search (NFO, BFO, or NCO). Preference:
       1. exact expiry match
       2. nearest expiry >= option_expiry
       3. nearest overall (fallback)
     """
-    u = (underlying or "").strip().upper()
     exp = _parse_expiry(option_expiry)
-    if not u or exp is None:
+    if exp is None:
         return None
 
-    futs = [f for f in _cached_futs() if f["name"] == u]
+    futs = _futs_named(underlying, exchange)
     if not futs:
         return None
 
@@ -305,13 +324,13 @@ def resolve_near_month_future(
     underlying: str,
     *,
     as_of: date | str | None = None,
+    exchange: str | None = None,
 ) -> Optional[dict]:
     """
-    Pick nearest NFO/BFO FUT for ``underlying`` with expiry >= as_of (default: today).
+    Pick nearest FUT for ``underlying`` with expiry >= as_of (default: today).
+
+    ``exchange`` restricts the search (NFO, BFO, or NCO).
     """
-    u = (underlying or "").strip().upper()
-    if not u:
-        return None
     if as_of is None:
         today = date.today()
     else:
@@ -319,7 +338,7 @@ def resolve_near_month_future(
         if today is None:
             return None
 
-    futs = [f for f in _cached_futs() if f["name"] == u and f["expiry"] >= today]
+    futs = [f for f in _futs_named(underlying, exchange) if f["expiry"] >= today]
     if not futs:
         return None
     chosen = sorted(futs, key=lambda f: (f["expiry"], f["tradingsymbol"]))[0]
@@ -329,13 +348,13 @@ def resolve_near_month_future(
 def resolve_away_month_future(
     underlying: str,
     near_expiry: date | str,
+    exchange: str | None = None,
 ) -> Optional[dict]:
-    """Pick the next NFO/BFO FUT for ``underlying`` with expiry strictly after ``near_expiry``."""
-    u = (underlying or "").strip().upper()
+    """Pick the next FUT for ``underlying`` with expiry strictly after ``near_expiry``."""
     exp = _parse_expiry(near_expiry)
-    if not u or exp is None:
+    if exp is None:
         return None
-    futs = [f for f in _cached_futs() if f["name"] == u and f["expiry"] > exp]
+    futs = [f for f in _futs_named(underlying, exchange) if f["expiry"] > exp]
     if not futs:
         return None
     chosen = sorted(futs, key=lambda f: (f["expiry"], f["tradingsymbol"]))[0]
@@ -395,9 +414,12 @@ def get_future_price_for_option(
     credentials: Optional[dict],
     underlying: str,
     option_expiry: date | str,
+    exchange: str | None = None,
 ) -> tuple[Optional[float], Optional[dict], str]:
     """
     Resolve FUT contract + price for an option underlier/expiry.
+
+    ``exchange`` selects the listing (NFO, BFO, or NCO).
 
     Monthly expiries (exact FUT match) use the listed quote.
     Weeklies before the near-month FUT: synthetic from spot and near-month.
@@ -415,7 +437,7 @@ def get_future_price_for_option(
 
     cash_spot = _cash_spot_from_redis(r, underlying)
 
-    fut = resolve_future(underlying, option_expiry)
+    fut = resolve_future(underlying, option_expiry, exchange=exchange)
     if not fut:
         if cash_spot > 0:
             price, source = _spot_interest_underlier(
@@ -437,10 +459,10 @@ def get_future_price_for_option(
 
     today = _ist_today()
     opt_exp = _parse_expiry(option_expiry)
-    near = resolve_near_month_future(underlying, as_of=today)
+    near = resolve_near_month_future(underlying, as_of=today, exchange=exchange)
     away = None
     if near:
-        away = resolve_away_month_future(underlying, near["expiry"])
+        away = resolve_away_month_future(underlying, near["expiry"], exchange=exchange)
 
     between_two = (
         near is not None
@@ -513,21 +535,24 @@ def future_tokens_for_pairs(
     pairs: list[tuple[str, date | str]],
     credentials: Optional[dict] = None,
 ) -> list[int]:
-    """Resolve unique FUT instrument tokens for ``(underlying, expiry)`` pairs."""
+    """Resolve unique FUT tokens for ``(underlying, expiry[, exchange])`` pairs."""
     if credentials:
         refresh_nfo_futures(
             credentials.get("api_key") or "",
             credentials.get("access_token") or "",
         )
     tokens: set[int] = set()
-    for underlying, expiry in pairs:
-        fut = resolve_future(underlying, expiry)
+    for item in pairs:
+        underlying = item[0]
+        expiry = item[1]
+        exchange = item[2] if len(item) > 2 else None
+        fut = resolve_future(underlying, expiry, exchange=exchange)
         if fut:
             tokens.add(int(fut["instrument_token"]))
-        near = resolve_near_month_future(underlying)
+        near = resolve_near_month_future(underlying, exchange=exchange)
         if near:
             tokens.add(int(near["instrument_token"]))
-            away = resolve_away_month_future(underlying, near["expiry"])
+            away = resolve_away_month_future(underlying, near["expiry"], exchange=exchange)
             if away:
                 tokens.add(int(away["instrument_token"]))
     return sorted(tokens)

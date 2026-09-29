@@ -193,7 +193,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         # 3. Load option chains into memory store
         _load_option_chains(option_chain_store, underlying_symbols)
 
-        # 3b. Resolve NFO futures for Greeks underliers and merge into WS set
+        # 3b. Resolve NFO/BFO/NCO futures for Greeks underliers and merge into WS set
         try:
             refresh_nfo_futures(credentials["api_key"], credentials["access_token"], force=True)
             fut_tokens = option_chain_store.future_tokens_for_subscription(credentials)
@@ -210,7 +210,6 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             # Seed futures LTP hash (full quotes arrive via WS)
             try:
                 from stream.token_fetcher import fetch_ltps_from_kite, fetch_quotes_from_kite
-                from stream.redis_writer import write_ticks_batch
 
                 quotes = fetch_quotes_from_kite(
                     credentials["api_key"], credentials["access_token"], fut_tokens,

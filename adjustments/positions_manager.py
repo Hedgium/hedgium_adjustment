@@ -351,7 +351,7 @@ def _normalize_live_position(pos: dict) -> dict:
          zerodha_instrument_token, underlying_symbol, strike,
          option_type, expiry (ISO str), lot_size, quote_unit}
 
-    Zerodha MCX/CDS broker quantity is lot count; expand to canonical economic
+    Zerodha MCX/NCO/CDS broker quantity is lot count; expand to canonical economic
     units so quote_unit scaling in get_greeks_for_position is consistent with
     Hedgium book qty.
     """
@@ -371,8 +371,8 @@ def _normalize_live_position(pos: dict) -> dict:
         quote_unit = 1.0
 
     broker = (pos.get("broker_name") or "").strip().upper()
-    # Zerodha MCX/CDS APIs use lot count; Hedgium Greeks expect economic units.
-    if broker == "ZERODHA" and exchange in {"MCX", "CDS"} and lot_size > 1:
+    # Zerodha MCX/NCO/CDS APIs use lot count; Hedgium Greeks expect economic units.
+    if broker == "ZERODHA" and exchange in {"MCX", "NCO", "CDS"} and lot_size > 1:
         qty_int = qty_int * lot_size
 
     return {

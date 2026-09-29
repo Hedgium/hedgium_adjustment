@@ -72,6 +72,7 @@ def enrich_positions_with_option_chain(
     - ``expiry``  (ISO date string)
     - ``lot_size``
     - ``zerodha_tradingsymbol``
+    - ``exchange`` (option listing, e.g. NCO)
     """
     ts_index = _build_tradingsymbol_index(store)
 
@@ -112,6 +113,9 @@ def enrich_positions_with_option_chain(
                 qu = 1.0
             p["quote_unit"] = qu if qu > 0 else 1.0
             p["zerodha_tradingsymbol"] = chain.get("zerodha_tradingsymbol") or ""
+            chain_ex = (chain.get("exchange") or "").strip().upper()
+            if chain_ex:
+                p["exchange"] = chain_ex
         else:
             logger.warning(
                 "optionchain_lookup: no OptionChain match for tradingsymbol=%r "

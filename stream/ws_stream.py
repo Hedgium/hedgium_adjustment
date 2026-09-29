@@ -25,6 +25,12 @@ WS_URL_TEMPLATE = "wss://ws.kite.trade?api_key={api_key}&access_token={access_to
 STREAM_MODE = "full"
 CHUNK = cfg.MAX_INSTRUMENTS_PER_WS
 
+# Low byte of a Kite instrument token is the exchange segment.
+# kiteconnect divides unknown segments by 100. NCO is segment 12 and uses
+# the same 10000 divisor as BCD, so uncorrected NCO prices are 100× too high.
+_NCO_SEGMENT = 12
+_NCO_PRICE_SCALE = 0.01
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Binary frame parser (uses kiteconnect library)
@@ -76,6 +82,44 @@ def _enrich_bid_ask(tick: dict) -> dict:
     return tick
 
 
+def _scale_nco_price(value):
+    try:
+        return float(value) * _NCO_PRICE_SCALE
+    except (TypeError, ValueError):
+        return value
+
+
+def correct_nco_tick_prices(tick: dict) -> dict:
+    """Bring NCO quotes back to rupees. Other segments are left unchanged."""
+    try:
+        segment = int(tick.get("instrument_token")) & 0xff
+    except (TypeError, ValueError):
+        return tick
+    if segment != _NCO_SEGMENT:
+        return tick
+
+    for field in ("last_price", "average_traded_price", "bid_price", "ask_price"):
+        if tick.get(field) is not None:
+            tick[field] = _scale_nco_price(tick[field])
+
+    ohlc = tick.get("ohlc")
+    if isinstance(ohlc, dict):
+        for field in ("open", "high", "low", "close"):
+            if ohlc.get(field) is not None:
+                ohlc[field] = _scale_nco_price(ohlc[field])
+
+    depth = tick.get("depth")
+    if isinstance(depth, dict):
+        for side in ("buy", "sell"):
+            rows = depth.get(side) or []
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict) and row.get("price") is not None:
+                    row["price"] = _scale_nco_price(row["price"])
+    return tick
+
+
 def parse_binary_ticks(api_key: str, access_token: str, data: bytes) -> list[dict]:
     if not data or len(data) < 2:
         return []
@@ -91,7 +135,7 @@ def parse_binary_ticks(api_key: str, access_token: str, data: bytes) -> list[dic
             continue
         safe = _json_safe(t)
         if isinstance(safe, dict):
-            out.append(_enrich_bid_ask(safe))
+            out.append(correct_nco_tick_prices(_enrich_bid_ask(safe)))
     return out
 
 
