@@ -195,3 +195,75 @@ def test_compute_greeks_for_builder_enriches_per_leg_metadata():
     assert snap["future_by_underlying"]["NIFTY"] == 24550.0
     assert snap["future_expiry_by_underlying"]["NIFTY"] == "2026-03-26"
     assert leg["calculated_at"]
+
+
+def _position(exchange, token, instrument):
+    return {
+        "position_id": token,
+        "zerodha_instrument_token": token,
+        "underlying_symbol": "CRUDEOIL",
+        "strike": 9500,
+        "option_type": "CE",
+        "expiry": "2026-10-15",
+        "quantity": -100,
+        "exchange": exchange,
+        "lot_size": 100,
+        "quote_unit": 1,
+        "instrument": instrument,
+    }
+
+
+def test_mcx_quote_prices_nco_positions_when_builder_has_both():
+    """MCX and NCO legs share a name; the liquid MCX future prices both."""
+    r = MagicMock()
+    seen = []
+
+    def _greeks(_r, **kwargs):
+        seen.append((kwargs["instrument_label"], kwargs["underlying_spot"]))
+        return {
+            "instrument": kwargs["instrument_label"],
+            "zerodha_instrument_token": kwargs["zerodha_instrument_token"],
+            "delta": 0.4,
+            "gamma": 0.01,
+            "theta": -1.0,
+            "vega": 2.0,
+            "net_delta": -0.4,
+            "net_gamma": -0.01,
+            "net_theta": 1.0,
+            "net_vega": -2.0,
+            "greeks_source": "gamma_adj",
+            "bid": 164.6,
+            "ask": 165.1,
+            "ltp": 165.1,
+            "mid": 164.85,
+            "iv": 0.0,
+        }
+
+    builder_data = {
+        "builder_id": 217,
+        "strategy_id": 209,
+        "positions": [
+            _position("NCO", 34281228, "CRUDEOIL26OCT9500CE"),
+            _position("MCX", 148605191, "CRUDEOIL15OCT269500CE"),
+        ],
+        "legs": [
+            {"token": 33538828, "symbol": "CRUDEOIL", "exchange": "NCO"},
+            {"token": 145894407, "symbol": "CRUDEOIL", "exchange": "MCX"},
+        ],
+    }
+    with patch("adjustments.greeks.get_future_price", return_value=(8726.0, "ltp")) as mcx_quote:
+        with patch("adjustments.greeks.get_future_price_for_option") as nco_underlier:
+            with patch("adjustments.greeks.get_underlying_spot", return_value=8701.0):
+                with patch("adjustments.greeks.get_greeks_for_position", side_effect=_greeks):
+                    with patch("adjustments.greeks.resolve_near_month_future", return_value=None):
+                        snap = compute_greeks_for_builder(r, builder_data)
+
+    assert snap is not None
+    assert seen == [
+        ("CRUDEOIL26OCT9500CE", 8726.0),
+        ("CRUDEOIL15OCT269500CE", 8726.0),
+    ]
+    assert snap["spot_by_underlying"]["CRUDEOIL"] == 8726.0
+    mcx_quote.assert_called_once()
+    assert mcx_quote.call_args.args[2] == 145894407
+    nco_underlier.assert_not_called()

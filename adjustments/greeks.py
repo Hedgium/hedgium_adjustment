@@ -34,6 +34,26 @@ logger = logging.getLogger(__name__)
 # Legacy cash-spot BS rate (unused on futures underlier path).
 DEFAULT_RISK_FREE_RATE = 0.065
 
+# Low byte of a Kite instrument token. Used when a builder leg has no exchange.
+_MCX_SEGMENT = 7
+_NCO_SEGMENT = 12
+
+
+def _listing_exchange(leg: dict) -> str:
+    """MCX / NCO / other listing for a builder leg."""
+    ex = (leg.get("exchange") or "").strip().upper()
+    if ex:
+        return ex
+    try:
+        seg = int(leg.get("token")) & 0xff
+    except (TypeError, ValueError):
+        return ""
+    if seg == _MCX_SEGMENT:
+        return "MCX"
+    if seg == _NCO_SEGMENT:
+        return "NCO"
+    return ""
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Time helpers
@@ -358,11 +378,42 @@ def compute_greeks_for_builder(
     spot_by_underlying: dict[str, float] = {}
     legs = builder_data.get("legs") or []
     leg_token_by_symbol: dict[str, int] = {}
+    mcx_token_by_symbol: dict[str, int] = {}
+    nco_token_by_symbol: dict[str, int] = {}
     for leg in legs:
         tok_leg = leg.get("token")
         sym = (leg.get("symbol") or "").strip().upper()
-        if tok_leg and sym:
-            leg_token_by_symbol[sym] = int(tok_leg)
+        if not tok_leg or not sym:
+            continue
+        tok_leg = int(tok_leg)
+        listing = _listing_exchange(leg)
+        if listing == "MCX":
+            mcx_token_by_symbol[sym] = tok_leg
+        elif listing == "NCO":
+            nco_token_by_symbol[sym] = tok_leg
+        leg_token_by_symbol[sym] = tok_leg
+    # Same name on both commodity listings: the MCX future is the liquid price.
+    both_listings = set(mcx_token_by_symbol) & set(nco_token_by_symbol)
+    for sym in both_listings:
+        leg_token_by_symbol[sym] = mcx_token_by_symbol[sym]
+    mcx_quote_by_symbol: dict[str, tuple[float, str]] = {}
+
+    def _mcx_shared_quote(under: str) -> Optional[tuple[float, str]]:
+        """MCX future quote reused for NCO positions when the builder has both."""
+        if under not in both_listings:
+            return None
+        if under not in mcx_quote_by_symbol:
+            price, src = get_future_price(
+                r, credentials, mcx_token_by_symbol[under],
+            )
+            mcx_quote_by_symbol[under] = (
+                float(price) if price and float(price) > 0 else 0.0,
+                src or "",
+            )
+        price, src = mcx_quote_by_symbol[under]
+        if price <= 0:
+            return None
+        return price, src
 
     per_leg: list[dict] = []
     book_positions: list[dict] = []
@@ -395,15 +446,28 @@ def compute_greeks_for_builder(
         fkey = (under, expiry, exchange)
         exchange_by_underlying.setdefault(under, exchange)
         if fkey not in fut_by_key:
-            price, _fut, src = get_future_price_for_option(
-                r, credentials, under, expiry, exchange=exchange,
+            shared = (
+                _mcx_shared_quote(under)
+                if exchange in {"MCX", "NCO"}
+                else None
             )
-            fut_by_key[fkey] = float(price) if price and price > 0 else 0.0
-            fut_src_by_key[fkey] = src or ""
+            if shared:
+                fut_by_key[fkey] = shared[0]
+                fut_src_by_key[fkey] = shared[1]
+            else:
+                price, _fut, src = get_future_price_for_option(
+                    r, credentials, under, expiry, exchange=exchange,
+                )
+                fut_by_key[fkey] = float(price) if price and price > 0 else 0.0
+                fut_src_by_key[fkey] = src or ""
 
         if under not in spot_by_underlying:
-            cash_spot = get_underlying_spot(r, under, leg_token_by_symbol.get(under))
-            spot_by_underlying[under] = float(cash_spot) if cash_spot and cash_spot > 0 else 0.0
+            shared = _mcx_shared_quote(under)
+            if shared:
+                spot_by_underlying[under] = shared[0]
+            else:
+                cash_spot = get_underlying_spot(r, under, leg_token_by_symbol.get(under))
+                spot_by_underlying[under] = float(cash_spot) if cash_spot and cash_spot > 0 else 0.0
 
         fut = fut_by_key.get(fkey, 0.0)
         if fut <= 0:
