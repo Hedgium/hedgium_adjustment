@@ -593,12 +593,12 @@ def compute_greeks_for_builder(
     #         for (u, exp), p in fut_by_key.items()
     #     },
     # )
-    # logger.info(
-    #     "greeks_by_legs: builder_id=%s strategy_id=%s %s",
-    #     builder_id,
-    #     strategy_id,
-    #     greeks_by_legs,
-    # )
+    logger.info(
+        "greeks_by_legs: builder_id=%s strategy_id=%s %s",
+        builder_id,
+        strategy_id,
+        greeks_by_legs,
+    )
     logger.info(
         "[net-delta] builder_id=%s strategy_id=%s legs=%s "
         "net_delta_by_underlying=%s net_gamma=%.6f cash_spot=%s near_month_fut=%s",
