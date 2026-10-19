@@ -92,14 +92,46 @@ def _wait_for_credentials() -> dict:
             time.sleep(cfg.WAIT_POLL_S)
 
 
+def _idle_until_session(*, reason: str) -> None:
+    """Sleep until the next session boundary (or a short poll), for empty books."""
+    from market_sessions import (
+        derivative_exchanges_open,
+        seconds_until_next_boundary,
+    )
+
+    try:
+        open_ex = sorted(derivative_exchanges_open())
+    except Exception:
+        open_ex = []
+    delay = seconds_until_next_boundary(
+        max_sleep_s=max(cfg.WAIT_POLL_S, 60.0),
+        min_sleep_s=cfg.WAIT_POLL_S,
+    )
+    logger.info(
+        "worker: idle — %s (open_exchanges=%s); wake in %.0fs",
+        reason,
+        open_ex,
+        delay,
+    )
+    time.sleep(delay)
+
+
 def _wait_for_tokens(credentials: dict):
-    """Block until at least one instrument token is available."""
+    """
+    Block until at least one instrument token is available.
+
+    Empty sets (holiday / commodity-only with no MCX strategies) idle until
+    the next session boundary instead of error-looping.
+    """
     while True:
         try:
             token_set = collect_stream_tokens(credentials)
             tokens = sorted(set(token_set.option_tokens + token_set.equity_tokens))
             if not tokens:
-                raise ValueError("No tokens — check active builders and OptionChain rows")
+                _idle_until_session(
+                    reason="no tokens for open exchanges / active builders",
+                )
+                continue
             return token_set, tokens
         except Exception as exc:
             logger.warning(
@@ -521,6 +553,30 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             "worker": "hedgium_stream_worker",
         })
 
+        # Adjustments can gamma-adjust yesterday's AUTO rows while the live
+        # bootstrap is still computing. The runner must be alive during that pass.
+        adj_runner: AdjustmentRunner | None = None
+
+        def _ensure_adjustment_runner() -> None:
+            nonlocal adj_runner
+            if not run_adjustments or adj_runner is not None:
+                return
+            adj_runner = AdjustmentRunner(
+                r,
+                positions_manager=positions_manager,
+                option_chain_store=option_chain_store,
+                greeks_ready=_first_greeks_ready,
+                credentials=credentials,
+            )
+            adj_runner.start()
+
+        if option_chain_store.has_db_baseline():
+            logger.info(
+                "worker: adjustments using previous-session Greek baseline "
+                "until live update finishes"
+            )
+            _ensure_adjustment_runner()
+
         # 6b. Bootstrap Greeks from live ticks before adjustments run
         if option_chain_store.size():
             try:
@@ -534,6 +590,11 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         if option_chain_store.has_fresh_greeks():
             _first_greeks_ready.set()
             logger.info("worker: Greek bootstrap ready — adjustments may run")
+        elif option_chain_store.has_db_baseline():
+            logger.info(
+                "worker: Greek bootstrap incomplete — adjustments continue on "
+                "previous-session baseline"
+            )
         else:
             logger.warning(
                 "worker: Greek bootstrap incomplete — adjustments blocked until "
@@ -559,17 +620,8 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         thread_positions.start()
         tick_thread.start()
 
-        # 8. Adjustment runner
-        adj_runner: AdjustmentRunner | None = None
-        if run_adjustments:
-            adj_runner = AdjustmentRunner(
-                r,
-                positions_manager=positions_manager,
-                option_chain_store=option_chain_store,
-                greeks_ready=_first_greeks_ready,
-                credentials=credentials,
-            )
-            adj_runner.start()
+        # 8. Adjustment runner (already started when a DB baseline was present)
+        _ensure_adjustment_runner()
 
         logger.info(
             "worker running: %s WS connections, %s tokens, "
@@ -588,6 +640,13 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
         # Start the clock now so the first reload check waits a full interval
         # (monotonic()-0 would always fire immediately after each restart).
         last_reload_t = time.monotonic()
+        from market_sessions import IST, next_session_boundary, refresh_session_from_backend
+
+        try:
+            next_boundary = next_session_boundary()
+        except Exception:
+            next_boundary = None
+
         try:
             while not _stop_requested.is_set():
                 time.sleep(2)
@@ -605,12 +664,37 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                     should_restart = True
                     break
 
+                # Force token reload at session boundaries (9:00 / 9:15 / 15:45 / …).
+                now_ist = datetime.now(IST)
+                if next_boundary is not None and now_ist >= next_boundary:
+                    logger.info(
+                        "worker: session boundary reached (%s) — reloading tokens",
+                        next_boundary.isoformat(),
+                    )
+                    should_restart = True
+                    break
+
                 now_m = time.monotonic()
                 if now_m - last_reload_t >= cfg.RELOAD_CHECK_INTERVAL_S:
                     last_reload_t = now_m
                     try:
+                        try:
+                            refresh_session_from_backend()
+                            next_boundary = next_session_boundary()
+                        except Exception:
+                            logger.debug(
+                                "worker: session refresh failed", exc_info=True
+                            )
+
                         latest = collect_stream_tokens(credentials)
                         latest_base = sorted(set(latest.option_tokens + latest.equity_tokens))
+                        if not latest_base:
+                            logger.info(
+                                "worker: token set empty for current session — "
+                                "stopping streams until next boundary"
+                            )
+                            should_restart = True
+                            break
                         # Merge futures the same way as startup so we don't
                         # false-trigger on 108 (with FUT) vs 106 (backend only).
                         try:

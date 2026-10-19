@@ -126,10 +126,29 @@ def get_stream_config(mode: str = "auto") -> dict:
           "underlying_tokens": [int, ...],
           "underlying_token_by_symbol": {...},
           "option_chains": [...],
-          "auto_strike_distance_buffer": int
+          "auto_strike_distance_buffer": int,
+          "active_derivative_exchanges": [...]
         }
     """
     return _request("GET", "stream/config", params={"mode": mode})
+
+
+def get_stream_session() -> dict:
+    """
+    Current IST derivative session (holidays + evening-only).
+
+    Returns::
+
+        {
+          "active_derivative_exchanges": [...],
+          "natural_derivative_exchanges": [...],
+          "nse_session_on": bool,
+          "mcx_session_on": "none"|"regular"|"evening_only",
+          "next_boundary_at": str (ISO),
+          "respect_session": bool,
+        }
+    """
+    return _request("GET", "stream/session")
 
 
 def post_greeks_bulk_upsert(greeks: list[dict]) -> dict:

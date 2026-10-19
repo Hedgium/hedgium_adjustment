@@ -267,3 +267,73 @@ def test_mcx_quote_prices_nco_positions_when_builder_has_both():
     mcx_quote.assert_called_once()
     assert mcx_quote.call_args.args[2] == 145894407
     nco_underlier.assert_not_called()
+
+
+def test_previous_session_baseline_is_gamma_adjusted_and_not_persisted():
+    """Yesterday's AUTO row is usable until a live update, and is not upserted."""
+    from adjustments.option_chain_store import OptionChainStore
+
+    store = OptionChainStore()
+    store.load([{
+        "zerodha_instrument_token": 101,
+        "underlying_symbol": "NIFTY",
+        "strike": 24000,
+        "option_type": "CE",
+        "expiry": "2026-10-28",
+        "lot_size": 65,
+        "greeks_calculated_by": "AUTO",
+        "greeks_delta": 0.4,
+        "greeks_gamma": 0.001,
+        "greeks_theta": -5.0,
+        "greeks_vega": 3.0,
+        "auto_delta_spot": 24500.0,
+        "greeks_updated_at": "2026-10-18T10:00:00",
+    }])
+
+    assert store.has_db_baseline()
+    assert store.has_fresh_greeks() is False
+    assert store.get_greeks_payload() == []
+
+    row = store.get_chain_by_token(101)
+    r = MagicMock()
+    with patch("adjustments.greeks.fetch_tick_by_token", return_value=None):
+        greeks = get_greeks_for_position(
+            r,
+            zerodha_instrument_token=101,
+            underlying_spot=24600.0,
+            strike=24000.0,
+            option_type="CE",
+            expiry=date(2026, 10, 28),
+            quantity=65,
+            instrument_label="NIFTY26OCT24000CE",
+            stored_chain=row,
+        )
+
+    assert greeks is not None
+    assert greeks["greeks_source"] == "gamma_adj"
+    # (24600 - 24500) * 0.001 + 0.4
+    assert greeks["delta"] == 0.5
+
+
+def test_manual_db_row_is_not_a_futures_baseline():
+    from adjustments.option_chain_store import OptionChainStore
+
+    store = OptionChainStore()
+    store.load([{
+        "zerodha_instrument_token": 202,
+        "underlying_symbol": "NIFTY",
+        "strike": 24000,
+        "option_type": "CE",
+        "expiry": "2026-10-28",
+        "lot_size": 65,
+        "greeks_calculated_by": "MANUAL",
+        "greeks_delta": 0.4,
+        "greeks_gamma": 0.001,
+        "manual_delta_spot": 24500.0,
+        "greeks_updated_at": "2026-10-18T10:00:00",
+    }])
+
+    assert store.has_db_baseline() is False
+    row = store.get_chain_by_token(202)
+    assert row["from_db_seed"] is False
+    assert row["computed_at_spot"] == 24500.0

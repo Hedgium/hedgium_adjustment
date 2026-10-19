@@ -102,8 +102,15 @@ class AdjustmentRunner:
 
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _adjustments_unblocked(self) -> bool:
+        """Live Greeks, or a previous-session baseline the gamma path can use."""
+        if self._greeks_ready is not None and self._greeks_ready.is_set():
+            return True
+        store = self._option_chain_store
+        return bool(store is not None and store.has_db_baseline())
+
     def _loop(self):
-        if self._greeks_ready is not None:
+        if self._greeks_ready is not None and not self._adjustments_unblocked():
             logger.info(
                 "AdjustmentRunner: waiting for Greek bootstrap (timeout=%.0fs)…",
                 cfg.GREEKS_BOOTSTRAP_TIMEOUT_S,
@@ -114,8 +121,13 @@ class AdjustmentRunner:
                     "skipping cycles until Greeks are available",
                     cfg.GREEKS_BOOTSTRAP_TIMEOUT_S,
                 )
+        elif self._option_chain_store is not None and self._option_chain_store.has_db_baseline():
+            logger.info(
+                "AdjustmentRunner: using previous-session Greek baseline "
+                "until the live update finishes"
+            )
         while not self._stop_event.wait(cfg.ADJUSTMENTS_INTERVAL_S):
-            if self._greeks_ready is not None and not self._greeks_ready.is_set():
+            if self._greeks_ready is not None and not self._adjustments_unblocked():
                 logger.debug("AdjustmentRunner: Greeks not ready — skipping cycle")
                 continue
             try:
