@@ -225,16 +225,22 @@ class LivePositionsManager:
         shared-broker / multi-profile fetches do not double-count the same
         book.  Also dedupe by (tradingsymbol, exchange, product).
 
-        Falls back to the original book positions if no live positions are
-        found for a builder's underlyings (so Greek computation still runs).
+        Falls back to in-session DB book positions when the broker has no live
+        match. Positions on a closed exchange (hours or holiday) are dropped,
+        so a closed NSE book is not adjusted from the last database snapshot.
 
         Returns a new list; the original ``builders`` dicts are not mutated.
         """
         with self._lock:
             live_positions = list(self._positions)
 
+        active_exchanges = derivative_exchanges_open()
+
         if not live_positions:
-            return builders
+            return [
+                _builder_with_session_book(builder, active_exchanges)
+                for builder in builders
+            ]
 
         # Group live positions by underlying and by (profile_id, underlying)
         live_by_underlying: dict[str, list[dict]] = {}
@@ -281,7 +287,10 @@ class LivePositionsManager:
                 else:
                     matched.extend(live_by_underlying.get(u) or [])
 
-            matched = _dedupe_live_positions(matched)
+            matched = _positions_in_session(
+                _dedupe_live_positions(matched),
+                active_exchanges,
+            )
 
             if matched:
                 # Normalize live positions into the same shape as book positions
@@ -292,17 +301,28 @@ class LivePositionsManager:
                     b.get("builder_id"), len(matched), sorted(underlyings), master_pid,
                 )
             else:
+                kept = _positions_in_session(b.get("positions") or [], active_exchanges)
+                b["positions"] = kept
                 unenriched = sum(
                     1 for p in live_positions
                     if not (p.get("underlying_symbol") or "").strip()
                 )
-                logger.warning(
-                    "LivePositionsManager.map_to_builders: builder_id=%s — "
-                    "no live match for underlyings=%s profile_id=%s "
-                    "(live_total=%s unenriched=%s) → keeping DB book positions",
-                    b.get("builder_id"), sorted(underlyings), master_pid,
-                    len(live_positions), unenriched,
-                )
+                if kept:
+                    logger.warning(
+                        "LivePositionsManager.map_to_builders: builder_id=%s — "
+                        "no live match for underlyings=%s profile_id=%s "
+                        "(live_total=%s unenriched=%s) → keeping %s in-session DB positions",
+                        b.get("builder_id"), sorted(underlyings), master_pid,
+                        len(live_positions), unenriched, len(kept),
+                    )
+                else:
+                    logger.info(
+                        "LivePositionsManager.map_to_builders: builder_id=%s — "
+                        "no in-session book (underlyings=%s open=%s)",
+                        b.get("builder_id"),
+                        sorted(underlyings),
+                        sorted(active_exchanges),
+                    )
 
             result.append(b)
 
@@ -312,6 +332,23 @@ class LivePositionsManager:
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _positions_in_session(positions: list[dict], active_exchanges: frozenset[str]) -> list[dict]:
+    return [
+        pos for pos in positions
+        if position_in_derivative_session(pos, active_exchanges)
+    ]
+
+
+def _builder_with_session_book(builder: dict, active_exchanges: frozenset[str]) -> dict:
+    """Shallow copy with DB positions limited to the current session."""
+    copied = dict(builder)
+    copied["positions"] = _positions_in_session(
+        copied.get("positions") or [],
+        active_exchanges,
+    )
+    return copied
+
 
 def _dedupe_live_positions(positions: list[dict]) -> list[dict]:
     """
