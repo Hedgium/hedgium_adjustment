@@ -125,12 +125,22 @@ def collect_stream_tokens(credentials: dict) -> StreamTokenSet:
     """
     Build the subscription token set by calling the backend config API.
 
-    Raises ``ValueError`` if the backend reports no tokens.
+    Empty token sets are valid (no active builders on open exchanges / holiday /
+    commodity-only window with no MCX strategies). Callers idle until the next
+    session boundary.
     """
+    from market_sessions import set_cached_session
+
     data = backend_api.get_stream_config(mode=cfg.STREAM_MODE)
 
     if "error" in data:
         raise ValueError(data["error"])
+
+    # Keep worker session cache in sync with backend (holidays / evening-only).
+    set_cached_session(
+        data.get("active_derivative_exchanges") or [],
+        next_boundary_at=data.get("next_boundary_at"),
+    )
 
     option_chains = data.get("option_chains") or []
     underlying_tokens: list[int] = data.get("underlying_tokens") or []
@@ -138,11 +148,6 @@ def collect_stream_tokens(credentials: dict) -> StreamTokenSet:
         str(k): int(v)
         for k, v in (data.get("underlying_token_by_symbol") or {}).items()
     }
-
-    if not underlying_tokens:
-        raise ValueError(
-            "No BuilderLeg.token values for active StrategyBuilders — set token on legs"
-        )
 
     option_tokens: list[int] = []
     zerodha_symbol_by_token: dict[int, str] = {}
@@ -158,7 +163,26 @@ def collect_stream_tokens(credentials: dict) -> StreamTokenSet:
             zerodha_symbol_by_token[t] = sym.upper()
 
     option_tokens = sorted(set(option_tokens))
-    equity_tokens = sorted(set(underlying_tokens))
+    equity_tokens = sorted(set(int(t) for t in underlying_tokens))
+
+    if not equity_tokens and not option_tokens:
+        logger.info(
+            "token_fetcher: no tokens for current session "
+            "(exchanges=%s) — idle until next boundary",
+            data.get("active_derivative_exchanges") or [],
+        )
+        return StreamTokenSet(
+            option_tokens=[],
+            equity_tokens=[],
+            zerodha_symbol_by_token={},
+            ltp_by_underlying_token={},
+            underlying_token_by_symbol={},
+        )
+
+    if not equity_tokens:
+        raise ValueError(
+            "No BuilderLeg.token values for active StrategyBuilders — set token on legs"
+        )
 
     ltp_by_underlying_token = _fetch_initial_ltps(
         credentials["api_key"],
@@ -170,11 +194,12 @@ def collect_stream_tokens(credentials: dict) -> StreamTokenSet:
 
     logger.info(
         "token_fetcher: underlying_tokens=%s underlying_symbols=%s "
-        "option_tokens=%s equity_tokens=%s",
+        "option_tokens=%s equity_tokens=%s exchanges=%s",
         equity_tokens,
         sorted(underlying_token_by_symbol.keys()),
         len(option_tokens),
         len(equity_tokens),
+        data.get("active_derivative_exchanges") or [],
     )
 
     return StreamTokenSet(

@@ -83,6 +83,10 @@ def _seed_computed_from_db_row(entry: dict, row: dict) -> None:
     """
     Seed worker computed Greek fields from persisted OptionChain DB values so
     gamma-adjusted adjustments work before the first update_greeks() cycle.
+
+    AUTO rows are marked ``from_db_seed`` so a previous-session baseline stays
+    usable after the freshness window. MANUAL rows stay unmarked: their
+    reference spot is cash, and adjustment checks pass futures ``F``.
     """
     calc_by = (row.get("greeks_calculated_by") or "").upper()
     db_delta = _float_or_none(row.get("greeks_delta"))
@@ -103,6 +107,8 @@ def _seed_computed_from_db_row(entry: dict, row: dict) -> None:
     entry["vega"] = _float_or_none(row.get("greeks_vega"))
     entry["computed_at_spot"] = ref_spot
     entry["last_greeks_at"] = _iso_or_none(row.get("greeks_updated_at"))
+    if calc_by != "MANUAL":
+        entry["from_db_seed"] = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -210,9 +216,7 @@ class OptionChainStore:
                 prev = old.get(tok)
                 if prev is None:
                     continue
-                for field in self._COMPUTED_FIELDS:
-                    if prev.get(field) is not None:
-                        entry[field] = prev[field]
+                self._apply_carried_greeks(entry, prev)
             self._chains = new
             if dividend_by_underlying is not None:
                 self._dividend_by_underlying = dict(dividend_by_underlying)
@@ -236,9 +240,7 @@ class OptionChainStore:
             for tok, entry in incoming.items():
                 if tok in self._chains:
                     prev = self._chains[tok]
-                    for field in self._COMPUTED_FIELDS:
-                        if prev.get(field) is not None:
-                            entry[field] = prev[field]
+                    self._apply_carried_greeks(entry, prev)
                     self._chains[tok].update(entry)
                 else:
                     self._chains[tok] = entry
@@ -287,6 +289,7 @@ class OptionChainStore:
                 "vega": None,
                 "last_greeks_at": None,
                 "computed_at_spot": None,
+                "from_db_seed": False,
             }
             _seed_computed_from_db_row(new[tok], row)
         return new
@@ -322,6 +325,16 @@ class OptionChainStore:
                 pairs.add((u, exp, ex))
         return sorted(pairs)
 
+    def _apply_carried_greeks(self, entry: dict, prev: dict) -> None:
+        """Keep in-memory Greeks across a reload, including the DB-seed flag."""
+        carried = False
+        for field in self._COMPUTED_FIELDS:
+            if prev.get(field) is not None:
+                entry[field] = prev[field]
+                carried = True
+        if carried:
+            entry["from_db_seed"] = bool(prev.get("from_db_seed"))
+
     def future_tokens_for_subscription(self, credentials: dict | None = None) -> list[int]:
         """Resolve NFO/BFO/NCO FUT tokens needed for Greeks underliers."""
         return future_tokens_for_pairs(self.underlying_expiry_pairs(), credentials)
@@ -342,6 +355,19 @@ class OptionChainStore:
                     return True
             except Exception:
                 continue
+        return False
+
+    def has_db_baseline(self) -> bool:
+        """True if a previous-session AUTO Greek row is still waiting on a live update."""
+        with self._lock:
+            rows = list(self._chains.values())
+        for row in rows:
+            if (
+                row.get("from_db_seed")
+                and row.get("delta") is not None
+                and row.get("computed_at_spot") is not None
+            ):
+                return True
         return False
 
     def update_greeks(self, r, credentials: dict) -> int:
@@ -490,6 +516,7 @@ class OptionChainStore:
                     "vega": round(stored_vega, 6),
                     "last_greeks_at": now_iso,
                     "computed_at_spot": cash_spot,
+                    "from_db_seed": False,
                 }
                 continue
 
@@ -550,6 +577,7 @@ class OptionChainStore:
                     "vega": round(g["vega"], 6),
                     "last_greeks_at": now_iso,
                     "computed_at_spot": F,
+                    "from_db_seed": False,
                 }
                 ot = (row.get("option_type") or "").upper()
                 if ot == "CE":
@@ -606,8 +634,10 @@ class OptionChainStore:
 
         payload = []
         for row in rows:
-            # Only persist rows where Greeks have been computed
-            if row.get("delta") is None:
+            # Seeded previous-session rows stay out of the upsert until a live
+            # update_greeks() pass replaces them. Persisting them would move
+            # auto_delta_spot onto yesterday's reference.
+            if row.get("delta") is None or row.get("from_db_seed"):
                 continue
             payload.append({
                 "zerodha_instrument_token": row["zerodha_instrument_token"],

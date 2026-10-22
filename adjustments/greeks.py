@@ -133,11 +133,16 @@ def _implied_vol(
 
 def _stored_greeks_fresh(sc: dict) -> bool:
     """
-    Return True if the in-memory Greeks are present and were computed within
-    the last ``GREEKS_STALE_THRESHOLD_S`` seconds.
+    Return True if the in-memory Greeks can be gamma-adjusted.
+
+    A previous-session DB seed (``from_db_seed``) stays usable until
+    ``update_greeks()`` replaces it. A live baseline must have been computed
+    within the last ``GREEKS_STALE_THRESHOLD_S`` seconds.
     """
     if sc.get("delta") is None or sc.get("computed_at_spot") is None:
         return False
+    if sc.get("from_db_seed"):
+        return True
     last_at = sc.get("last_greeks_at")
     if not last_at:
         return False
@@ -171,14 +176,15 @@ def get_greeks_for_position(
     ``quote_unit`` scales money/risk nets: net_* = per_unit × qty / quote_unit
     (MCX gold is quoted ₹/10g; GOLDM qty=100 → quote_unit=10).
 
-    Path 1 — Gamma-adjusted (in-memory baseline is fresh)
-        Uses the delta/gamma/spot stored by the last ``update_greeks()`` run.
+    Path 1 — Gamma-adjusted (in-memory baseline is fresh, or a DB seed)
+        Uses the delta/gamma/spot from the last ``update_greeks()`` run, or from
+        the previous session's AUTO row until that pass replaces it.
         Applies:  delta = (S - computed_at_spot) × gamma + stored_delta
         No Black-Scholes is run.
 
     Path 2 — Black-Scholes fallback
         Used when the in-memory baseline is absent or older than
-        ``GREEKS_STALE_THRESHOLD_S`` seconds (default 5 min).
+        ``GREEKS_STALE_THRESHOLD_S`` seconds (default 5 min) and is not a DB seed.
         Runs fresh IV → BS from live Redis tick with ``r=0``.
 
     ``stored_chain`` is a row from ``OptionChainStore.get_chain_by_token()``.
