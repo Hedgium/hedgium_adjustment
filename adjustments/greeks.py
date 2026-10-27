@@ -27,7 +27,7 @@ from adjustments.futures_underlier import (
     get_future_price_for_option,
     resolve_near_month_future,
 )
-from stream.redis_writer import fetch_tick_by_token, fetch_ltps, resolve_underlying_zerodha_token
+from stream.redis_writer import fetch_tick_by_token, resolve_underlying_zerodha_token
 
 logger = logging.getLogger(__name__)
 
@@ -314,31 +314,46 @@ def get_greeks_for_position(
 # Underlying spot resolution
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_underlying_spot(r, underlying_symbol: str, leg_token: Optional[int] = None) -> float:
+def get_underlying_spot(
+    r,
+    underlying_symbol: str,
+    leg_token: Optional[int] = None,
+    credentials: Optional[dict] = None,
+) -> float:
     """
-    Resolve underlying spot from Redis.
+    Cash/index LTP used for absolute delta.
 
-    Priority:
-    1. Live tick for the underlying token (written by ws_stream equity subscription)
-    2. LTP hash (seeded at startup by token_fetcher)
+    1. Live websocket tick (``mystream:ticks`` ``last_price``)
+    2. Kite ``/quote/ohlc`` when that tick is missing
     """
     utok = leg_token
     if utok is None:
         utok = resolve_underlying_zerodha_token(r, underlying_symbol)
+    if not utok:
+        return 0.0
 
-    if utok:
-        tick = fetch_tick_by_token(r, utok)
-        if tick:
+    tick = fetch_tick_by_token(r, int(utok))
+    if tick:
+        try:
             lp = float(tick.get("last_price") or 0)
-            if lp > 0:
-                return lp
+        except (TypeError, ValueError):
+            lp = 0.0
+        if lp > 0:
+            return lp
 
-        ltps = fetch_ltps(r)
-        sp = ltps.get(utok)
-        if sp and sp > 0:
-            return float(sp)
+    api_key = (credentials or {}).get("api_key") or ""
+    access_token = (credentials or {}).get("access_token") or ""
+    if not api_key or not access_token:
+        return 0.0
 
-    return 0.0
+    from stream.token_fetcher import fetch_ltps_from_kite
+
+    quoted = fetch_ltps_from_kite(api_key, access_token, [int(utok)])
+    try:
+        sp = float(quoted.get(int(utok)) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return sp if sp > 0 else 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -472,7 +487,9 @@ def compute_greeks_for_builder(
             if shared:
                 spot_by_underlying[under] = shared[0]
             else:
-                cash_spot = get_underlying_spot(r, under, leg_token_by_symbol.get(under))
+                cash_spot = get_underlying_spot(
+                    r, under, leg_token_by_symbol.get(under), credentials=credentials,
+                )
                 spot_by_underlying[under] = float(cash_spot) if cash_spot and cash_spot > 0 else 0.0
 
         fut = fut_by_key.get(fkey, 0.0)
