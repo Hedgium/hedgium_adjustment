@@ -1,7 +1,11 @@
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-from adjustments.greeks import compute_greeks_for_builder, get_greeks_for_position
+from adjustments.greeks import (
+    compute_greeks_for_builder,
+    get_greeks_for_position,
+    get_underlying_spot,
+)
 
 
 def test_get_greeks_for_position_short_quantity_signs():
@@ -337,3 +341,38 @@ def test_manual_db_row_is_not_a_futures_baseline():
     row = store.get_chain_by_token(202)
     assert row["from_db_seed"] is False
     assert row["computed_at_spot"] == 24500.0
+
+
+def test_underlying_spot_uses_websocket_tick():
+    r = MagicMock()
+    with patch(
+        "adjustments.greeks.fetch_tick_by_token",
+        return_value={"last_price": 24510.5},
+    ) as tick, patch("stream.token_fetcher.fetch_ltps_from_kite") as ohlc:
+        spot = get_underlying_spot(r, "NIFTY", 256265, credentials={"api_key": "k", "access_token": "t"})
+    tick.assert_called_once_with(r, 256265)
+    ohlc.assert_not_called()
+    assert spot == 24510.5
+
+
+def test_underlying_spot_falls_back_to_quote_ohlc_when_tick_missing():
+    r = MagicMock()
+    with patch("adjustments.greeks.fetch_tick_by_token", return_value=None), patch(
+        "stream.token_fetcher.fetch_ltps_from_kite",
+        return_value={256265: 24480.0},
+    ) as ohlc:
+        spot = get_underlying_spot(
+            r, "NIFTY", 256265, credentials={"api_key": "k", "access_token": "t"},
+        )
+    ohlc.assert_called_once_with("k", "t", [256265])
+    assert spot == 24480.0
+
+
+def test_underlying_spot_is_zero_without_tick_or_credentials():
+    r = MagicMock()
+    with patch("adjustments.greeks.fetch_tick_by_token", return_value=None), patch(
+        "stream.token_fetcher.fetch_ltps_from_kite",
+    ) as ohlc:
+        spot = get_underlying_spot(r, "NIFTY", 256265)
+    ohlc.assert_not_called()
+    assert spot == 0.0

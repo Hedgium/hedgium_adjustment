@@ -112,6 +112,116 @@ def fetch_quotes_from_kite(
         return {}
 
 
+def classify_kite_token_response(status_code: int, body: object) -> str:
+    """
+    Classify a Kite REST response for the market-profile access token.
+
+    ``ok`` — token accepted. ``rejected`` — token missing/expired (Kite
+    ``TokenException``, HTTP 401/403). ``unknown`` — network or server
+    failure; callers must not treat that as an expired token.
+    """
+    if status_code == 200:
+        return "ok"
+    if status_code in (401, 403):
+        return "rejected"
+    text = ""
+    if isinstance(body, dict):
+        text = f"{body.get('error_type') or ''} {body.get('message') or ''}"
+    elif body:
+        text = str(body)
+    lowered = text.lower()
+    if "tokenexception" in lowered or "incorrect `api_key`" in lowered or "incorrect api_key" in lowered:
+        return "rejected"
+    return "unknown"
+
+
+def kite_token_status(api_key: str, access_token: str) -> str:
+    """
+    Probe ``GET /user/profile``.
+
+    Returns ``ok``, ``rejected``, or ``unknown`` (see
+    ``classify_kite_token_response``). Does not raise.
+    """
+    if not api_key or not access_token:
+        return "rejected"
+    try:
+        import requests as _requests
+
+        resp = _requests.get(
+            "https://api.kite.trade/user/profile",
+            headers={
+                "X-Kite-Version": "3",
+                "Authorization": f"token {api_key}:{access_token}",
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("token_fetcher: broker token check failed: %s", exc)
+        return "unknown"
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    status = classify_kite_token_response(resp.status_code, body)
+    if status == "rejected":
+        logger.warning(
+            "token_fetcher: broker access token rejected by Kite (http %s)",
+            resp.status_code,
+        )
+    return status
+
+
+def should_probe_broker_token(
+    access_token: str,
+    *,
+    rejected_access_token: str | None,
+    last_probe_at: float | None,
+    now: float,
+    recheck_s: float = 300.0,
+) -> bool:
+    """
+    Probe Kite immediately for a new token.
+
+    After a rejection, re-check the same token at ``recheck_s`` so a transient
+    403 can recover, without calling Kite on every backend poll.
+    """
+    if not access_token:
+        return False
+    if access_token != (rejected_access_token or ""):
+        return True
+    if last_probe_at is None:
+        return True
+    return (now - last_probe_at) >= recheck_s
+
+
+def decide_credential_action(
+    creds: dict | None,
+    *,
+    rejected_access_token: str | None,
+    token_status: str,
+) -> str:
+    """
+    ``ready`` — Kite accepted this access token.
+
+    ``ready_unverified`` — probe failed open (network); use it unless it is
+    the token Kite already rejected.
+
+    ``wait`` — missing, or expired. Caller keeps polling until auto-login
+    stores a different token.
+    """
+    api_key = str((creds or {}).get("api_key") or "")
+    token = str((creds or {}).get("access_token") or "")
+    if not api_key or not token:
+        return "wait"
+    if token_status == "ok":
+        return "ready"
+    if token_status == "rejected":
+        return "wait"
+    if rejected_access_token and token == rejected_access_token:
+        return "wait"
+    return "ready_unverified"
+
+
 def _fetch_initial_ltps(
     api_key: str,
     access_token: str,

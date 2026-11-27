@@ -59,7 +59,12 @@ from stream.redis_writer import (
     write_ticks_batch,
     write_underlying_symbol_token_map,
 )
-from stream.token_fetcher import collect_stream_tokens
+from stream.token_fetcher import (
+    collect_stream_tokens,
+    decide_credential_action,
+    kite_token_status,
+    should_probe_broker_token,
+)
 from stream.ws_stream import KiteQuoteStreamer, run_multi_connection_stream
 from adjustments.runner import AdjustmentRunner
 from adjustments.option_chain_store import OptionChainStore
@@ -75,15 +80,89 @@ def _get_redis() -> _redis.Redis:
     return _redis.from_url(cfg.REDIS_URL, decode_responses=True)
 
 
-def _wait_for_credentials() -> dict:
-    """Block until the backend returns valid broker credentials."""
+class BrokerTokenUnavailable(Exception):
+    """Kite rejected the access token currently stored on the market profile."""
+
+    def __init__(self, access_token: str | None):
+        self.access_token = access_token or None
+        super().__init__(
+            "broker access token missing or expired; waiting for market auto-login"
+        )
+
+
+def _adopt_fresh_credentials(credentials: dict) -> None:
+    """
+    Re-read broker credentials before opening a stream.
+
+    ``_wait_for_tokens`` can sleep until the next session boundary (overnight).
+    Auto-login at 07:30 IST replaces the token during that sleep; the dict
+    captured at the start of the night must not be reused after the wake.
+    """
+    fresh = backend_api.get_credentials()
+    if "error" in fresh:
+        raise ValueError(fresh["error"])
+    token = str(fresh.get("access_token") or "")
+    api_key = str(fresh.get("api_key") or "")
+    if not api_key or not token:
+        raise BrokerTokenUnavailable(token or None)
+    current = str(credentials.get("access_token") or "")
+    if token != current:
+        logger.info(
+            "worker: broker access token updated — using the post-login token"
+        )
+        credentials.clear()
+        credentials.update(fresh)
+    if kite_token_status(api_key, token) == "rejected":
+        raise BrokerTokenUnavailable(token)
+
+
+def _wait_for_credentials(*, rejected_access_token: str | None = None) -> dict:
+    """
+    Block until the backend has a Kite access token we can stream with.
+
+    The market-profile token expires overnight and is still stored on the
+    profile until Celery ``auto_login_market_profile`` (07:30 IST) replaces
+    it. A rejected token is not reused: poll the backend until that login
+    stores a different one, and only probe Kite when the token changes or
+    the recheck interval elapses.
+    """
+    rejected = rejected_access_token or None
+    last_probe_at: float | None = None
+    last_probe_token = ""
     while True:
         try:
             creds = backend_api.get_credentials()
             if "error" in creds:
                 raise ValueError(creds["error"])
-            if not creds.get("api_key") or not creds.get("access_token"):
-                raise ValueError("api_key or access_token missing")
+            token = str(creds.get("access_token") or "")
+            api_key = str(creds.get("api_key") or "")
+            status = "unknown"
+            now = time.monotonic()
+            probe_at = last_probe_at if token == last_probe_token else None
+            if api_key and should_probe_broker_token(
+                token,
+                rejected_access_token=rejected,
+                last_probe_at=probe_at,
+                now=now,
+            ):
+                status = kite_token_status(api_key, token)
+                last_probe_at = now
+                last_probe_token = token
+            action = decide_credential_action(
+                creds,
+                rejected_access_token=rejected,
+                token_status=status,
+            )
+            if action == "wait":
+                if status == "rejected" and token:
+                    rejected = token
+                raise ValueError(
+                    "broker access token missing or expired; waiting for market auto-login"
+                )
+            if action == "ready_unverified":
+                logger.warning(
+                    "worker: could not verify broker token with Kite; continuing"
+                )
             return creds
         except Exception as exc:
             logger.warning(
@@ -125,6 +204,7 @@ def _wait_for_tokens(credentials: dict):
     """
     while True:
         try:
+            _adopt_fresh_credentials(credentials)
             token_set = collect_stream_tokens(credentials)
             tokens = sorted(set(token_set.option_tokens + token_set.equity_tokens))
             if not tokens:
@@ -133,6 +213,8 @@ def _wait_for_tokens(credentials: dict):
                 )
                 continue
             return token_set, tokens
+        except BrokerTokenUnavailable:
+            raise
         except Exception as exc:
             logger.warning(
                 "worker: waiting for tokens (%s); retry in %.0fs…", exc, cfg.WAIT_POLL_S
@@ -210,14 +292,26 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
     positions_manager = LivePositionsManager(option_chain_store=option_chain_store)
 
     # ── outer restart loop ────────────────────────────────────────────────────
+    # Set when Kite rejects the token this session is using. The next wait
+    # skips that access token until auto-login stores a new one.
+    rejected_access_token: str | None = None
     while not _stop_requested.is_set():
 
-        # 1. Credentials
-        credentials = _wait_for_credentials()
+        # 1. Credentials (blocks across the overnight expiry until 07:30 auto-login)
+        credentials = _wait_for_credentials(rejected_access_token=rejected_access_token)
+        rejected_access_token = None
         logger.info("worker: credentials OK (api_key=%s…)", credentials["api_key"][:6])
 
-        # 2. Token set (backend option + equity tokens)
-        token_set, base_tokens = _wait_for_tokens(credentials)
+        # 2. Token set (backend option + equity tokens).
+        # Idle sleeps past 07:30 must pick up the auto-login token; a rejected
+        # token returns here instead of looping inside the token wait.
+        try:
+            token_set, base_tokens = _wait_for_tokens(credentials)
+        except BrokerTokenUnavailable as exc:
+            rejected_access_token = exc.access_token
+            logger.warning("worker: %s; retry in %.0fs…", exc, cfg.WAIT_POLL_S)
+            time.sleep(cfg.WAIT_POLL_S)
+            continue
 
         option_tokens = sorted(set(token_set.option_tokens))
         underlying_symbols = sorted(token_set.underlying_token_by_symbol.keys())
@@ -637,6 +731,7 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
 
         # 9. Session watch loop
         should_restart = False
+        token_rejected = False
         # Start the clock now so the first reload check waits a full interval
         # (monotonic()-0 would always fire immediately after each restart).
         last_reload_t = time.monotonic()
@@ -653,6 +748,17 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
 
                 if r.get(cfg.REDIS_STOP_KEY) == "1":
                     logger.info("worker: stop flag set — shutting down")
+                    break
+
+                auth_dead = [s for s in streams if s.auth_rejected]
+                if auth_dead:
+                    logger.error(
+                        "worker: Kite rejected the broker token (%s) — "
+                        "waiting for market auto-login",
+                        [s.name for s in auth_dead],
+                    )
+                    token_rejected = True
+                    should_restart = True
                     break
 
                 dead = [s for s in streams if not s.is_alive()]
@@ -677,6 +783,32 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
                 now_m = time.monotonic()
                 if now_m - last_reload_t >= cfg.RELOAD_CHECK_INTERVAL_S:
                     last_reload_t = now_m
+                    try:
+                        fresh = backend_api.get_credentials()
+                        fresh_token = str(fresh.get("access_token") or "")
+                        current_token = str(credentials.get("access_token") or "")
+                        if fresh_token and fresh_token != current_token:
+                            logger.info(
+                                "worker: broker access token rotated — reloading "
+                                "(market auto-login replaces the overnight token)"
+                            )
+                            should_restart = True
+                            break
+                        status = kite_token_status(
+                            str(credentials.get("api_key") or ""),
+                            current_token,
+                        )
+                        if status == "rejected":
+                            logger.warning(
+                                "worker: broker access token expired — "
+                                "waiting for market auto-login"
+                            )
+                            token_rejected = True
+                            should_restart = True
+                            break
+                    except Exception:
+                        logger.debug("worker: credential refresh failed", exc_info=True)
+
                     try:
                         try:
                             refresh_session_from_backend()
@@ -763,6 +895,8 @@ def run(*, flush: bool = False, run_adjustments: bool = True) -> None:
             r.delete(cfg.REDIS_STOP_KEY)
 
         if should_restart and not _stop_requested.is_set():
+            if token_rejected:
+                rejected_access_token = str(credentials.get("access_token") or "") or None
             logger.info("worker: restarting in %.0fs…", cfg.DEAD_RESTART_S)
             time.sleep(cfg.DEAD_RESTART_S)
             continue

@@ -143,6 +143,25 @@ def parse_binary_ticks(api_key: str, access_token: str, data: bytes) -> list[dic
 # WebSocket streamer
 # ──────────────────────────────────────────────────────────────────────────────
 
+def is_kite_auth_failure(error: object) -> bool:
+    """True when Kite closed or rejected the socket because the access token is dead."""
+    status = getattr(error, "status_code", None)
+    if status in (401, 403):
+        return True
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "tokenexception",
+            "invalid token",
+            "incorrect `api_key`",
+            "incorrect api_key",
+            "handshake status 403",
+            "handshake status 401",
+        )
+    )
+
+
 def _subscribe_payload(tokens: Sequence[int], action: str = "subscribe") -> str:
     return json.dumps({"a": action, "v": [int(t) for t in tokens]})
 
@@ -171,6 +190,7 @@ class KiteQuoteStreamer:
         self.tokens = list(tokens)
         self.on_ticks = on_ticks
         self.name = name
+        self.auth_rejected = False
         self._ws: websocket.WebSocketApp | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -212,11 +232,33 @@ class KiteQuoteStreamer:
                 data = json.loads(message)
                 if data.get("type") == "error":
                     logger.error("%s: kite ws error: %s", self.name, data)
+                    detail = data.get("data") if data.get("data") is not None else data.get("message")
+                    if is_kite_auth_failure(detail if detail is not None else data):
+                        self._reject_auth()
             except json.JSONDecodeError:
                 logger.debug("%s: non-json text: %s", self.name, message[:200])
 
+    def _reject_auth(self) -> None:
+        """Stop reconnecting with this access token. The session loop fetches a new one."""
+        if self.auth_rejected:
+            return
+        self.auth_rejected = True
+        logger.error(
+            "%s: broker token rejected — stopping reconnects until auto-login",
+            self.name,
+        )
+        self._stop.set()
+        ws = self._ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
     def _on_error(self, ws, error):
         logger.error("%s: websocket error: %s", self.name, error)
+        if is_kite_auth_failure(error):
+            self._reject_auth()
 
     def _on_close(self, ws, status, msg):
         logger.warning("%s: closed status=%s msg=%s", self.name, status, msg)
